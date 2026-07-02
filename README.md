@@ -3,6 +3,7 @@
 - **Rung 1** — pure-PyTorch NSA, prove backward flows through the gate + 3 branches. ↓ below.
 - **Rung 2a** — matched NSA-vs-full baseline on real data; does NSA track full attention on held-out val loss? See [Rung 2a](#rung-2a--matched-baseline-nsa-vs-full-attention).
 - **Rung 2b (smoke test)** — throughput + peak VRAM for the ~1.5B config on one 3090, to pick a token budget. See [Rung 2b](#rung-2b--15b-smoke-test-throughput--vram).
+- **Kernel rung (step 1)** — Triton forward kernel for the NSA selection branch + correctness gate + benchmark. See [Kernel rung](#kernel-rung-step-1--nsa-selection-forward-in-triton).
 
 ---
 
@@ -281,3 +282,92 @@ Numbers are for the pure-PyTorch full-score path (correct, not fast). The
 bf16-master + 8-bit-Adam recipe trades numerical headroom for fit; a real run
 should watch for instability (loss spikes) and can fall back to fewer layers or a
 smaller `d_model` if needed. This rung measured *fit and speed only* — not loss.
+
+---
+
+# Kernel rung (step 1) — NSA selection forward in Triton
+
+**Question:** can we make the selection branch — the branch whose cost NSA actually
+cuts — a real Triton kernel that *matches the reference* and *scales past where dense
+attention OOMs*? **Forward only** (backward is the next step). Compression and
+sliding-window stay pure PyTorch for now.
+
+Correctness comes first: **fast-but-wrong fails the gate.**
+
+## Files (added this rung; purely additive — rung-1/2a files untouched)
+
+| file | what |
+|------|------|
+| `nsa_selection_kernel.py` | `selection_forward_reference` (pure torch, = rung-1's selection math) and `selection_forward_triton` (the kernel + launch wrapper). |
+| `test_kernel.py` | Correctness gate: `allclose(kernel, reference)` across shapes. |
+| `bench_kernel.py` | Throughput + VRAM sweep → CSV + two plots. |
+
+## How to run
+
+```bash
+source .venv/bin/activate
+nice -n 10 python test_kernel.py     # must print "GATE GREEN" first
+nice -n 10 python bench_kernel.py    # -> plots/{vram,toks}_vs_seqlen.png + CSV
+```
+
+## The kernel
+
+FlashAttention-style: one program per `(batch·kv-head, query position)`, online
+softmax, fp32 accumulation. The inner loop **iterates the gathered selected-block
+index list** (`block_idx[b, kv, i, :]`) — a gather, not a contiguous KV scan — which
+is the whole point. Q for the **whole GQA group** is loaded once so each gathered
+K/V block is reused by all `G` query heads (the gather amortizes across the group).
+bf16 in / fp32 accumulate, `tl.dot` (group padded to 16 lanes), autotuned over
+`num_warps`/`num_stages`. Targets Ampere (sm_86, RTX 3090).
+
+The block choice is an **input** (the compression branch produces it in the full
+model), so the kernel is tested in isolation. Trap-1 handling is unchanged: the
+top-k pick is upstream and non-differentiable; this kernel only consumes the index
+list.
+
+## Correctness gate — GREEN
+
+`test_kernel.py` varies seq_len, #heads, GQA group (incl. `G=1` and non-power-of-two
+`G=3`), head dim (32/64/128), block_size, and `S` (including `S >` a row's valid
+block count). All configs pass with max abs error **1e-5 – 2e-3** — far inside the
+bf16 tolerance (2e-2); the residual is just bf16 output rounding + summation order.
+
+## Benchmark — VRAM and the crossover
+
+`B1 Hq16 Hkv4 D64, block_size 64, S 16` (⇒ 1024 selected keys/query, **constant in
+T**). The reference is O(T²) (materializes the `[T,T]` score matrix); the kernel is
+O(T) (touches only the selected keys).
+
+| seq_len | kernel tok/s | kernel VRAM | ref tok/s | ref VRAM |
+|--------:|-------------:|------------:|----------:|---------:|
+| 512   | 292k | 0.003 GB | 662k | 0.07 GB |
+| 1024  | 303k | 0.014 GB | 631k | 0.25 GB |
+| 2048  | 329k | 0.020 GB | 365k | 0.92 GB |
+| **4096**  | **302k** | 0.031 GB | **170k** | 3.60 GB | ← kernel wins from here |
+| 8192  | 313k | 0.053 GB | 82k  | 14.24 GB |
+| 16384 | 315k | 0.097 GB | **OOM** | **OOM** | ← reference OOM ceiling |
+| 32768 | 300k | 0.185 GB | OOM | OOM |
+
+![vram](plots/vram_vs_seqlen.png)
+![toks](plots/toks_vs_seqlen.png)
+
+- **Throughput crossover: seq_len ≥ 4096.** Below that the dense reference is faster
+  (big efficient matmuls); above it the reference's O(T²) work dominates and the
+  sparse kernel's ~constant ~300k tok/s wins.
+- **Reference OOM ceiling: seq_len ≥ 16384** (under the 70% VRAM cap). Logged as a
+  real result — the bench catches `torch.cuda.OutOfMemoryError`, records the ceiling,
+  `empty_cache()`s, and continues. The kernel runs to 32k on <0.2 GB.
+
+## Resource discipline
+
+`torch.cuda.set_per_process_memory_fraction(0.70)` (hard-cap ~17GB, leaves ~7GB for
+Xorg/browser), `torch.set_num_threads(4)`, `nice -n 10`. OOM fails cleanly inside the
+budget instead of taking the desktop down.
+
+## Scope / next
+
+Forward only, selection branch only. Not yet done: the **backward kernel** (next
+step), fusing compression+window, and wiring the kernel back into `nsa_model.py`
+behind a flag. The kernel's absolute tok/s isn't tuned to the limit (broadcast-free
+`tl.dot` with a small padded group leaves throughput on the table) — the win here is
+**scaling** (flat VRAM, no O(T²) wall), which is what NSA is for.
