@@ -4,6 +4,7 @@
 - **Rung 2a** — matched NSA-vs-full baseline on real data; does NSA track full attention on held-out val loss? See [Rung 2a](#rung-2a--matched-baseline-nsa-vs-full-attention).
 - **Rung 2b (smoke test)** — throughput + peak VRAM for the ~1.5B config on one 3090, to pick a token budget. See [Rung 2b](#rung-2b--15b-smoke-test-throughput--vram).
 - **Kernel rung (step 1)** — Triton forward kernel for the NSA selection branch + correctness gate + benchmark. See [Kernel rung](#kernel-rung-step-1--nsa-selection-forward-in-triton).
+- **Kernel rung (step 2)** — Triton backward kernel for selection (dQ/dK/dV) + gradcheck gate + benchmark. See [Kernel rung step 2](#kernel-rung-step-2--nsa-selection-backward-in-triton).
 
 ---
 
@@ -371,3 +372,92 @@ step), fusing compression+window, and wiring the kernel back into `nsa_model.py`
 behind a flag. The kernel's absolute tok/s isn't tuned to the limit (broadcast-free
 `tl.dot` with a small padded group leaves throughput on the table) — the win here is
 **scaling** (flat VRAM, no O(T²) wall), which is what NSA is for.
+
+---
+
+# Kernel rung (step 2) — NSA selection backward in Triton
+
+**Question:** can the selection branch's **backward** (dQ, dK, dV) be a Triton kernel
+that matches autograd through the reference *and* keeps the flat-VRAM scaling? This
+step is **backward only** — fusion (compression+window) and `nsa_model.py` wiring are
+separate later steps. Purely additive: rung-1/2a files and the step-1 forward
+kernel/tests are untouched.
+
+## Files (added this step)
+
+| file | what |
+|------|------|
+| `nsa_selection_backward.py` | Triton backward kernel + `SelectionAttnTriton` autograd Function (Triton fwd + Triton bwd). |
+| `test_kernel_backward.py` | Gradcheck gate: Triton dQ/dK/dV vs autograd through `selection_forward_reference`. |
+| `bench_kernel_backward.py` | Backward throughput + VRAM sweep → CSV + two plots. |
+
+## Approach — softmax stats: RECOMPUTE (FlashAttention-2 style)
+
+The forward returns only `O` (we're not allowed to modify it to also emit the
+log-sum-exp), so the backward is self-contained:
+- **pass 1** re-derives per-row `(m_i, l_i)` with the *same* online-softmax loop as
+  forward (finite `NEG=-1e9` mask → all-masked rows never NaN),
+- **pass 2** recomputes `p_ij = exp(s_ij − m_i)/l_i` and the grads.
+
+Only `delta_i = Σ_d dO_i·O_i` is precomputed in torch from the saved `O`. Recompute
+(vs storing `p`) is what keeps memory **O(T)** — `p` is `[T × selected_keys]` and
+storing it would defeat the point. **dQ** is accumulated per query program (each
+query owns its row — no conflict). **dK/dV** are scattered (many queries select the
+same key block) via fp32 `atomic_add` into fp32 accumulators, cast to input dtype at
+the end. Same gather-not-scan structure as forward; `tl.dot` with the GQA group
+padded to 16 lanes.
+
+## Gradcheck gate — GREEN
+
+We can't use `torch.autograd.gradcheck`'s float64 numerical Jacobian (Ampere `tl.dot`
+has no fp64 path), so we compare analytical Triton grads vs analytical
+autograd-through-reference grads — a stronger check (exact vs exact). Same config
+matrix as the forward gate.
+
+| dtype | max dQ err | max dK err | max dV err | tol | verdict |
+|-------|-----------:|-----------:|-----------:|-----|:-------:|
+| fp32  | 1.7e-6 | 4.1e-6 | 4.1e-6 | 2e-3 | **PASS** (all 7 configs) |
+| bf16  | 7.8e-3 | 1.6e-2 | 3.9e-3 | 6e-2 | **PASS** (all 7 configs) |
+
+(across seq_len, #heads, GQA `G=1/2/3/4`, head dim 32/64/128, block_size, `S>` valid.)
+
+**Bug hit:** dK/dV came out ~1000× too large while dQ was exact. Cause: `triton.autotune`
+benchmarks each config by relaunching the kernel on the *same* output buffers, and
+dK/dV use `atomic_add` (accumulate) — so every trial piled on. dQ was fine because it
+uses `tl.store` (overwrite). Fix: `@triton.autotune(..., reset_to_zero=["dk_ptr","dv_ptr"])`.
+
+## Benchmark — flat VRAM holds for backward
+
+`B1 Hq16 Hkv4 D64, block_size 64, S 16`. Reference backward must **retain the O(T²)
+forward graph** (the `[T,T]` softmax probs) to differentiate; the kernel recomputes
+over the gathered blocks and only allocates dQ/dK/dV.
+
+| seq_len | kernel tok/s | kernel VRAM | ref tok/s | ref VRAM |
+|--------:|-------------:|------------:|----------:|---------:|
+| 512   | 96k | 0.03 GB | 711k | 0.12 GB |
+| 1024  | 73k | 0.04 GB | 408k | 0.40 GB |
+| 2048  | 67k | 0.06 GB | 247k | 1.48 GB |
+| 4096  | 58k | 0.10 GB | 120k | 5.77 GB |
+| 8192  | 59k | 0.18 GB | **OOM** | **OOM** |
+| 16384 | 58k | 0.34 GB | OOM | OOM |
+| 32768 | 54k | 0.66 GB | OOM | OOM |
+
+![vram-bwd](plots/vram_vs_seqlen_bwd.png)
+![toks-bwd](plots/toks_vs_seqlen_bwd.png)
+
+- **Flat-VRAM scaling confirmed**: kernel 0.03 → 0.66 GB (O(T)); reference O(T²),
+  **OOM at seq_len ≥ 8192** (logged as data — caught, recorded, `empty_cache`,
+  continued). The kernel runs to 32k on 0.66 GB.
+- **Honest speed note:** unlike the *forward* (which crossed over at 4096), the
+  backward kernel is *slower per-token* than the dense reference wherever the
+  reference fits — dense uses big efficient cuBLAS matmuls; the kernel pays for
+  (a) two passes (can't store the LSE — forward is unmodified), (b) the GQA group
+  padded to 16 lanes wasting ~4× for `G=4`, and (c) atomic scatter. Its win here is
+  **scaling** (constant VRAM, runs where dense OOMs), not raw throughput at moderate
+  T. Closing the speed gap (store LSE if forward is later allowed to emit it, tile
+  the group without padding, split-K for dK/dV) is a future optimization step.
+
+## Resource discipline
+
+`set_per_process_memory_fraction(0.70)`, `set_num_threads(4)`, `nice -n 10`; OOM
+caught, never crashes the process or spills.
