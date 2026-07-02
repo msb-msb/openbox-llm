@@ -145,9 +145,10 @@ class NSAAttention(nn.Module):
     """
 
     def __init__(self, d_model, n_q_heads, n_kv_heads,
-                 block_size=16, n_selected_blocks=4, window=32):
+                 block_size=16, n_selected_blocks=4, window=32, attn_impl="ref"):
         super().__init__()
         assert n_q_heads % n_kv_heads == 0, "GQA needs n_q_heads divisible by n_kv_heads"
+        assert attn_impl in ("ref", "fused"), "attn_impl must be 'ref' or 'fused'"
         self.d_model = d_model
         self.Hq = n_q_heads
         self.Hkv = n_kv_heads
@@ -156,6 +157,10 @@ class NSAAttention(nn.Module):
         self.block_size = block_size
         self.n_sel = n_selected_blocks
         self.window = window
+        # 'ref'  = the pure-torch rung-1 three-branch path (default, no Triton dep).
+        # 'fused'= route the three branches through the committed Triton kernels
+        #          (nsa_selection_kernel/backward + nsa_fused_kernel). Opt-in.
+        self.attn_impl = attn_impl
         scale = self.dh ** -0.5
         self.register_buffer("scale", torch.tensor(scale), persistent=False)
 
@@ -189,6 +194,9 @@ class NSAAttention(nn.Module):
         return x.view(B, T, n_heads, self.dh).transpose(1, 2)   # [B, H, T, dh]
 
     def forward(self, x):
+        if self.attn_impl == "fused":
+            return self._forward_fused(x)
+
         B, T, _ = x.shape
         Bsz = self.block_size
         n_blk = T // Bsz                    # number of complete blocks
@@ -295,6 +303,72 @@ class NSAAttention(nn.Module):
         out = out.transpose(1, 2).contiguous().view(B, T, self.Hq * self.dh)
         return self.out_proj(out)
 
+    def _forward_fused(self, x):
+        """Same math as forward(), but the three branches run on the Triton kernels.
+
+        Identical parameters, projections, pooling (comp_k/comp_v), gate, and out_proj
+        as the ref path — only the attention *computation* is swapped. The block
+        choice (block_idx) is still derived from the compression scores exactly as the
+        ref path and passed to the selection kernel as a NON-differentiable input
+        (trap-1: no gradient flows through the top-k pick). Kernels imported lazily so
+        the default 'ref' path keeps its torch+numpy-only footprint.
+        """
+        from nsa_fused_kernel import compression_attn_triton, window_attn_triton
+        from nsa_selection_backward import selection_attn_triton
+
+        B, T, _ = x.shape
+        Bsz = self.block_size
+        n_blk = T // Bsz
+        Tblk = n_blk * Bsz
+        dev = x.device
+
+        q = self._split_heads(self.q_proj(x), self.Hq).contiguous()     # [B,Hq,T,dh]
+
+        # --- window branch (Triton) ---
+        k_w = self._split_heads(self.k_win(x), self.Hkv).contiguous()
+        v_w = self._split_heads(self.v_win(x), self.Hkv).contiguous()
+        o_win = window_attn_triton(q, k_w, v_w, self.window)
+
+        if n_blk > 0:
+            # --- compression branch (Triton), same pooling as ref ---
+            k_c = self._split_heads(self.k_cmp(x), self.Hkv)
+            v_c = self._split_heads(self.v_cmp(x), self.Hkv)
+            k_cmp = self.comp_k(k_c[:, :, :Tblk].view(B, self.Hkv, n_blk, Bsz, self.dh))
+            v_cmp = self.comp_v(v_c[:, :, :Tblk].view(B, self.Hkv, n_blk, Bsz, self.dh))
+            o_cmp = compression_attn_triton(q, k_cmp.contiguous(), v_cmp.contiguous(), Bsz)
+
+            # --- block_idx from the (detached) compression scores == ref selection ---
+            # trap-1: the top-k pick is non-differentiable; derived under no_grad and
+            # fed to the selection kernel as a plain index input.
+            with torch.no_grad():
+                k_cmp_e = expand_kv(k_cmp, self.G)
+                s_cmp = torch.matmul(q, k_cmp_e.transpose(-1, -2)) * self.scale
+                t_idx = torch.arange(T, device=dev)[:, None]
+                blk_end = (torch.arange(n_blk, device=dev) + 1) * Bsz - 1
+                cmp_keep = (blk_end[None, :] <= t_idx)[None, None].expand(
+                    B, self.Hq, T, n_blk)
+                p_cmp = masked_softmax(s_cmp, cmp_keep)
+                imp = p_cmp.view(B, self.Hkv, self.G, T, n_blk).sum(dim=2)
+                imp = imp.masked_fill(~(blk_end[None, :] <= t_idx)[None, None],
+                                      torch.finfo(imp.dtype).min)
+                k_top = min(self.n_sel, n_blk)
+                block_idx = torch.topk(imp, k_top, dim=-1).indices.to(torch.int32)
+
+            # --- selection branch (Triton) ---
+            k_s = self._split_heads(self.k_slc(x), self.Hkv).contiguous()
+            v_s = self._split_heads(self.v_slc(x), self.Hkv).contiguous()
+            o_slc = selection_attn_triton(q, k_s, v_s, block_idx, Bsz)
+        else:
+            o_cmp = torch.zeros_like(q)
+            o_slc = torch.zeros_like(q)
+
+        # --- gate blend (identical to ref) ---
+        g = self.gate(x).view(B, T, self.Hq, 3)
+        g = torch.sigmoid(g).permute(0, 2, 1, 3)                        # [B,Hq,T,3]
+        out = (g[..., 0:1] * o_cmp + g[..., 1:2] * o_slc + g[..., 2:3] * o_win)
+        out = out.transpose(1, 2).contiguous().view(B, T, self.Hq * self.dh)
+        return self.out_proj(out)
+
 
 # ---------------------------------------------------------------------------
 # FULL (dense) attention — the matched baseline for rung 2a.
@@ -382,16 +456,17 @@ class NSATransformer(nn.Module):
     def __init__(self, vocab_size, d_model=512, n_layers=8, n_q_heads=8,
                  n_kv_heads=2, max_seq_len=256, ffn_mult=4,
                  block_size=16, n_selected_blocks=4, window=32,
-                 attn_type="nsa"):
+                 attn_type="nsa", attn_impl="ref"):
         super().__init__()
         self.max_seq_len = max_seq_len
         self.attn_type = attn_type
+        self.attn_impl = attn_impl
         self.grad_checkpoint = False   # toggled by trainer to trade compute for VRAM
         self.tok_emb = nn.Embedding(vocab_size, d_model)
         self.pos_emb = nn.Embedding(max_seq_len, d_model)
         self.blocks = nn.ModuleList([
             Block(d_model, n_q_heads, n_kv_heads, ffn_mult=ffn_mult,
-                  attn_type=attn_type,
+                  attn_type=attn_type, attn_impl=attn_impl,
                   block_size=block_size, n_selected_blocks=n_selected_blocks,
                   window=window)
             for _ in range(n_layers)

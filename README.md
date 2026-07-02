@@ -6,6 +6,7 @@
 - **Kernel rung (step 1)** — Triton forward kernel for the NSA selection branch + correctness gate + benchmark. See [Kernel rung](#kernel-rung-step-1--nsa-selection-forward-in-triton).
 - **Kernel rung (step 2)** — Triton backward kernel for selection (dQ/dK/dV) + gradcheck gate + benchmark. See [Kernel rung step 2](#kernel-rung-step-2--nsa-selection-backward-in-triton).
 - **Kernel rung (step 3)** — fuse compression + window into the kernel path; full three-branch fwd+bwd + gates + bench. See [Kernel rung step 3](#kernel-rung-step-3--fuse-compression--window-full-three-branch-path).
+- **Kernel rung (step 4)** — wire the fused kernel path into `nsa_model.py` behind `attn_impl`; parity + smoke gates. See [Kernel rung step 4](#kernel-rung-step-4--wire-the-fused-path-into-nsa_model-attn_impl-flag).
 
 ---
 
@@ -562,3 +563,86 @@ caught, never crashes/spills. Pooling and the gate-combine are torch (not fused 
 a kernel); q is re-read per branch — negligible here, and the win (flat VRAM,
 crossover at 2k) dominates. **Next (separate) step:** wire this fused path into
 `nsa_model.py` behind a flag.
+
+---
+
+# Kernel rung (step 4) — wire the fused path into `nsa_model` (`attn_impl` flag)
+
+**Question:** does swapping `NSAAttention`'s attention from the pure-torch rung-1 path
+to the committed Triton kernels change training at all? Integration only — no new
+kernels. Default stays **ref**; fused is opt-in.
+
+## How the flag is plumbed
+
+`NSATransformer(..., attn_impl="ref"|"fused")` → `Block` → `make_attention` →
+`NSAAttention.attn_impl`. When `"fused"`, `NSAAttention.forward` dispatches to
+`_forward_fused`, which:
+- keeps **identical** parameters, projections, compression pooling (`comp_k`/`comp_v`),
+  gate, and `out_proj`;
+- runs the three branches through `compression_attn_triton` / `selection_attn_triton`
+  / `window_attn_triton` (the committed kernels);
+- derives `block_idx` from the compression scores **exactly as the ref path, under
+  `no_grad`**, and passes it to the selection kernel as a non-differentiable index
+  input (**trap-1 preserved** — no gradient through the top-k pick).
+
+Kernels are imported **lazily** inside `_forward_fused`, so the default `ref` path
+keeps its torch+numpy-only footprint (no Triton import unless you opt in). Rung-1/2a
+training scripts and all kernel files are untouched; only `nsa_model.py` changed.
+
+## Gate 1 — loss parity (a few training steps, both ways)
+
+Same seed / weights / data / config; per-step `|Δloss|`:
+
+| dtype | max \|Δloss\| over 8 steps | tol |
+|-------|---------------------------:|-----|
+| fp32  | 4.8e-7 | 5e-4 |
+| bf16  | 5.5e-4 | 5e-2 |
+
+## Gate 2 — grad parity (one backward, all 52 params)
+
+| dtype | worst \|Δgrad\| | tol | verdict |
+|-------|----------------:|-----|:-------:|
+| fp32  | 1.1e-8 | 2e-3 | **PASS** |
+| bf16  | 2.4e-4 | 8e-2 | **PASS** |
+
+Grads match across every parameter — the flag does **not** silently change training
+dynamics. (Reported metric is absolute; a near-zero bias shows large *relative* error
+in bf16 but its absolute error is 2.4e-4.)
+
+## Gate 3 — smoke: 150M rung-2a config, `--kernel fused`
+
+80 steps on the cached FineWeb-Edu tokens, bf16, seq 512 / batch 8:
+
+- **Loss drops and tracks ref**: fused 10.975 → 7.582, ref 10.975 → 7.559 (final
+  Δ +0.023). The curves — including the transient spike at step 27 — overlap.
+- **Memory win at the model level** (not just the microbench):
+
+  | | peak VRAM |
+  |--|----------:|
+  | ref @ seq512 b8   | 14.12 GB |
+  | fused @ seq512 b8 | **7.82 GB** (−45%) |
+
+  Model-level VRAM vs seq_len (one fwd+bwd, batch 4): fused 5.1 → 7.6 → 13.0 GB at
+  512/1024/2048; **ref OOMs at seq 1024** (dense O(T²) score matrices × 16 layers)
+  where fused still fits. The kernel's flat-ish scaling carries through to the whole
+  model.
+
+![loss](plots/integration_loss.png)
+![vram](plots/integration_vram.png)
+
+## Files (added this step)
+
+| file | what |
+|------|------|
+| `nsa_model.py` (modified) | `attn_impl` flag + `NSAAttention._forward_fused` (lazy kernel imports). |
+| `test_integration.py` | loss-parity + grad-parity gates (fp32 tight, bf16 loose). |
+| `smoke_integration.py` | 150M rung-2a fused training smoke + model-level VRAM sweep. |
+
+## Notes / scope
+
+The fused path still materializes the compression scores `[B,Hq,T,n_blk]` under
+`no_grad` to derive `block_idx` (O(T²/Bsz), transient) — inherent to NSA's
+compression-drives-selection design and no worse than ref. Folding `block_idx`
+derivation into a fused compression kernel would remove even that, but that's a new
+kernel (out of scope here). Default remains `ref`; nothing about rung-1/2a behavior
+changes unless `attn_impl="fused"` is requested.
