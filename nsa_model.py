@@ -296,14 +296,73 @@ class NSAAttention(nn.Module):
 
 
 # ---------------------------------------------------------------------------
-# a tiny decoder-only transformer around NSA
+# FULL (dense) attention — the matched baseline for rung 2a.
 # ---------------------------------------------------------------------------
 
+class FullAttention(nn.Module):
+    """Standard causal GQA attention: the control arm of the matched baseline.
+
+    Deliberately the SAME shape as NSA on everything except the attention math:
+    identical query heads / kv heads / head dim, identical d_model in and out, a
+    shared query projection and single k/v projections, one output projection.
+    Kept as full-score + causal mask (same "correct, not fast" style as rung 1) —
+    no flash/SDPA fusion, so both arms use the same slow-but-transparent path.
+
+    Only difference vs NSA: NSA has THREE branches (each with its own k/v proj),
+    a per-block compressor, and a gate. Those extras are the documented param
+    delta between the two configs. Hidden dims are otherwise identical.
+    """
+
+    def __init__(self, d_model, n_q_heads, n_kv_heads):
+        super().__init__()
+        assert n_q_heads % n_kv_heads == 0, "GQA needs n_q_heads divisible by n_kv_heads"
+        self.Hq = n_q_heads
+        self.Hkv = n_kv_heads
+        self.G = n_q_heads // n_kv_heads
+        self.dh = d_model // n_q_heads
+        self.register_buffer("scale", torch.tensor(self.dh ** -0.5), persistent=False)
+        self.q_proj = nn.Linear(d_model, self.Hq * self.dh, bias=False)
+        self.k_proj = nn.Linear(d_model, self.Hkv * self.dh, bias=False)
+        self.v_proj = nn.Linear(d_model, self.Hkv * self.dh, bias=False)
+        self.out_proj = nn.Linear(self.Hq * self.dh, d_model, bias=False)
+
+    def _split_heads(self, x, n_heads):
+        B, T, _ = x.shape
+        return x.view(B, T, n_heads, self.dh).transpose(1, 2)
+
+    def forward(self, x):
+        B, T, _ = x.shape
+        q = self._split_heads(self.q_proj(x), self.Hq)                   # [B,Hq,T,dh]
+        k = expand_kv(self._split_heads(self.k_proj(x), self.Hkv), self.G)
+        v = expand_kv(self._split_heads(self.v_proj(x), self.Hkv), self.G)
+        s = torch.matmul(q, k.transpose(-1, -2)) * self.scale           # [B,Hq,T,T]
+        causal = torch.tril(torch.ones(T, T, dtype=torch.bool, device=x.device))
+        s = s.masked_fill(~causal[None, None], torch.finfo(s.dtype).min)
+        p = torch.softmax(s, dim=-1)
+        o = torch.matmul(p, v)                                          # [B,Hq,T,dh]
+        o = o.transpose(1, 2).contiguous().view(B, T, self.Hq * self.dh)
+        return self.out_proj(o)
+
+
+# ---------------------------------------------------------------------------
+# a tiny decoder-only transformer around NSA (or full attention, by flag)
+# ---------------------------------------------------------------------------
+
+def make_attention(attn_type, d_model, n_q_heads, n_kv_heads, **nsa_kw):
+    """Factory: the ONE place the nsa/full swap happens. Everything else is shared."""
+    if attn_type == "nsa":
+        return NSAAttention(d_model, n_q_heads, n_kv_heads, **nsa_kw)
+    if attn_type == "full":
+        return FullAttention(d_model, n_q_heads, n_kv_heads)   # nsa_kw ignored
+    raise ValueError(f"unknown attn_type {attn_type!r} (expected 'nsa' or 'full')")
+
+
 class Block(nn.Module):
-    def __init__(self, d_model, n_q_heads, n_kv_heads, ffn_mult=4, **nsa_kw):
+    def __init__(self, d_model, n_q_heads, n_kv_heads, ffn_mult=4,
+                 attn_type="nsa", **nsa_kw):
         super().__init__()
         self.ln1 = nn.LayerNorm(d_model)
-        self.attn = NSAAttention(d_model, n_q_heads, n_kv_heads, **nsa_kw)
+        self.attn = make_attention(attn_type, d_model, n_q_heads, n_kv_heads, **nsa_kw)
         self.ln2 = nn.LayerNorm(d_model)
         hidden = ffn_mult * d_model
         self.ffn = nn.Sequential(
@@ -321,13 +380,16 @@ class Block(nn.Module):
 class NSATransformer(nn.Module):
     def __init__(self, vocab_size, d_model=512, n_layers=8, n_q_heads=8,
                  n_kv_heads=2, max_seq_len=256, ffn_mult=4,
-                 block_size=16, n_selected_blocks=4, window=32):
+                 block_size=16, n_selected_blocks=4, window=32,
+                 attn_type="nsa"):
         super().__init__()
         self.max_seq_len = max_seq_len
+        self.attn_type = attn_type
         self.tok_emb = nn.Embedding(vocab_size, d_model)
         self.pos_emb = nn.Embedding(max_seq_len, d_model)
         self.blocks = nn.ModuleList([
             Block(d_model, n_q_heads, n_kv_heads, ffn_mult=ffn_mult,
+                  attn_type=attn_type,
                   block_size=block_size, n_selected_blocks=n_selected_blocks,
                   window=window)
             for _ in range(n_layers)

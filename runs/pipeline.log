@@ -1,0 +1,4 @@
+== 1/4 data prep (cached; skips if present) ==
+cache present, skipping. train=30.01M val=3.23M tokens (use --force to redo)
+== 2/4 train FULL attention (baseline) ==
+[full] params: 139.77M | vocab 50257 | train 30.0M val 3.2M tokens | device cuda

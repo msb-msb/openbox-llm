@@ -1,4 +1,11 @@
-# Open-Box LLM — Rung 1: Native Sparse Attention (pure PyTorch)
+# Open-Box LLM — rungs
+
+- **Rung 1** — pure-PyTorch NSA, prove backward flows through the gate + 3 branches. ↓ below.
+- **Rung 2a** — matched NSA-vs-full baseline on real data; does NSA track full attention on held-out val loss? See [Rung 2a](#rung-2a--matched-baseline-nsa-vs-full-attention).
+
+---
+
+# Rung 1: Native Sparse Attention (pure PyTorch)
 
 A minimal, **pure-PyTorch** implementation of **Native Sparse Attention** (NSA,
 DeepSeek — [arXiv:2502.11089](https://arxiv.org/abs/2502.11089)) inside a tiny
@@ -99,3 +106,98 @@ grad-norm table every step (`train_rung1.py`).
 
 Speed/kernels, long context, the trainable memory layer, quantization/offload —
 all later rungs. See `openbox-llm-objectives.md`.
+
+---
+
+# Rung 2a — matched baseline: NSA vs full attention
+
+**Question:** does NSA track full attention on a *generalization* task (held-out
+val loss), and is our matched-baseline harness sound?
+
+The **harness is the deliverable.** One codebase, the attention module swapped by a
+single flag — `--attn {nsa,full}` — with *everything else held identical*: same
+transformer, same tokenized data **and data order** (batches are precomputed from
+the seed, so both arms see byte-identical inputs in the same order), same seed,
+optimizer, schedule, steps, and eval set. The only thing that differs is the
+attention math (`FullAttention` vs `NSAAttention` in `nsa_model.py`, selected in
+`make_attention()`).
+
+## Files (added this rung)
+
+| file | what |
+|------|------|
+| `data_prep.py`   | Stream a FineWeb-Edu sample, tokenize with GPT-2 BPE (tiktoken), cache a fixed train/val split to `data/*.bin` (uint16). Tokenized **once**. |
+| `train_rung2a.py`| The matched harness. `--attn {nsa,full}`; logs train+val loss to CSV, writes config JSON + checkpoint. |
+| `plot_val.py`    | Overlay both val-loss curves → `plots/val_loss.png`. **This plot is the result.** |
+| `run_rung2a.sh`  | data → full → nsa → plot, all under `nice -n 10`. |
+| `nsa_model.py`   | +`FullAttention` (matched GQA baseline) and `attn_type` flag. |
+
+## How to run
+
+```bash
+source .venv/bin/activate
+# one command does everything (data is cached, so reruns skip tokenization):
+nice -n 10 ./run_rung2a.sh                      # optional: pass extra flags, e.g. --steps 8000
+
+# or step by step:
+nice -n 10 python data_prep.py                  # -> data/train.bin, data/val.bin (once)
+nice -n 10 python train_rung2a.py --attn full   # baseline
+nice -n 10 python train_rung2a.py --attn nsa    # NSA
+nice -n 10 python plot_val.py                   # -> plots/val_loss.png
+```
+
+Defaults: ~150M params, `d_model=768, n_layers=16`, GQA `12q/4kv`, `seq_len=512`,
+`batch=8`, `5000` steps, bf16 autocast. Both arms train in well under an hour each
+on an RTX 3090.
+
+## Matched configs & the param delta
+
+Both arms are byte-for-byte identical except attention. NSA is slightly larger —
+its three branches each carry their own k/v projections, plus a block compressor
+and the gate. Everything else (embeddings ≈38.6M tied, FFN, LayerNorms, shared
+query projection, output projection) is the same.
+
+| config | params | where the delta lives |
+|--------|--------|-----------------------|
+| `full` | ~140.2M | 1× k/v projection per layer |
+| `nsa`  | ~153.4M | 3× k/v projections + compressor + gate per layer |
+| **Δ**  | **+13.2M (~9%)** | entirely inside attention; hidden dims otherwise identical |
+
+(Run either arm; the exact count for both is printed and saved to
+`runs/{attn}_config.json`.)
+
+## What success looks like
+
+- **NSA's val curve tracks full attention within a small margin** — the paper says
+  NSA can match or beat dense; for this rung we only need *tracks, no pathology*
+  (no divergence, no blow-up, no stuck-high loss). `plot_val.py` prints the final
+  `gap(nsa-full)` and annotates it on the plot.
+- Both curves descend smoothly on held-out data (train < 1 epoch, so val is a real
+  generalization measurement, not memorization).
+
+## Reproducibility
+
+Seeded (`--seed`, default 1337) across torch/numpy/cuda and the data-window
+schedule. `requirements.txt` pins the environment; each run's full config +
+param counts + data meta are saved to `runs/{attn}_config.json`; checkpoints to
+`runs/{attn}_ckpt.pt`.
+
+## Resource discipline (Miu is a daily-use workstation)
+
+- `torch.set_num_threads(4)` — leaves cores for the desktop.
+- Dataloader `num_workers=2, pin_memory=True` (not `os.cpu_count()`).
+- Run everything `nice -n 10` (baked into `run_rung2a.sh`).
+- VRAM: default `batch=8, seq_len=512` peaks ~14GB (NSA) / ~9GB (full) — well under
+  21GB free. `PYTORCH_CUDA_ALLOC_CONF=expandable_segments:True` is set to avoid
+  fragmentation OOMs. **If you raise batch/context and near OOM, lower `--batch_size`
+  — never let it spill to system RAM/swap.**
+- Data is streamed as a small subset and cached to `data/` once, not re-tokenized
+  per run.
+
+## Rung-2a scope / caveats
+
+Still pure PyTorch, full-score + keep-mask (correct, not fast — block-gather and
+Triton are later rungs). `seq_len=512` is short: NSA's efficiency payoff is a
+*long-context* story (64k+) and is explicitly **not** what this rung measures —
+here we only check that sparse attention generalizes on par with dense at small
+scale, and that the comparison harness is sound.
