@@ -2,6 +2,7 @@
 
 - **Rung 1** — pure-PyTorch NSA, prove backward flows through the gate + 3 branches. ↓ below.
 - **Rung 2a** — matched NSA-vs-full baseline on real data; does NSA track full attention on held-out val loss? See [Rung 2a](#rung-2a--matched-baseline-nsa-vs-full-attention).
+- **Rung 2b (smoke test)** — throughput + peak VRAM for the ~1.5B config on one 3090, to pick a token budget. See [Rung 2b](#rung-2b--15b-smoke-test-throughput--vram).
 
 ---
 
@@ -201,3 +202,82 @@ Triton are later rungs). `seq_len=512` is short: NSA's efficiency payoff is a
 *long-context* story (64k+) and is explicitly **not** what this rung measures —
 here we only check that sparse attention generalizes on par with dense at small
 scale, and that the comparison harness is sound.
+
+---
+
+# Rung 2b — 1.5B smoke test (throughput + VRAM)
+
+**Smoke test only — no full run, no plot.** Goal: measure real throughput and peak
+VRAM for the ~1.5B config on this 3090 so we can pick a token budget. Hard cap:
+peak VRAM **< 18GB** (Xorg already uses ~3GB of the 24GB card).
+
+Run it (`smoke_rung2b.py`, ~60s of real fwd+bwd+opt steps):
+
+```bash
+nice -n 10 python smoke_rung2b.py --attn nsa --batch 16 \
+    --optim adam8bit --weight_dtype bf16 --grad_ckpt --seconds 60
+```
+
+## The 1.5B config (scaled from rung 2a, same-hidden-dims framing)
+
+`d_model=2048, n_layers=30, GQA 16 q-heads / 4 kv-heads, ffn_mult=4, ctx 512`.
+
+| arm | params |
+|-----|--------|
+| `full` | **1.426B** |
+| `nsa`  | **1.556B** (delta = NSA's per-branch k/v + gate + compressor, all in attention) |
+
+## The problem: a fixed ~25GB floor
+
+A 1.5B model under **plain fp32 AdamW** needs ~4× params of memory just for
+weights + grads + Adam moments (m, v) = ~25GB. That FIXED cost busts the 24GB card
+*before any activations* — so batch size and gradient checkpointing (which only
+shrink activation memory) can't fix it. Measured:
+
+| step | config | result |
+|------|--------|--------|
+| baseline | fp32 AdamW, batch 4 | **OOM** (~24.1GB) |
+| ladder 1 | fp32 AdamW, batch **1** | **OOM** (~23.9GB) — batch doesn't help |
+| ladder 2 | fp32 AdamW, batch 1, **+ckpt** | **OOM** (~24.1GB) — ckpt doesn't help |
+| ladder 3 | **8-bit Adam** + ckpt, batch 1 | runs, but **19.1GB > 18GB cap** |
+
+8-bit Adam cuts the moments (12.4GB → 3.1GB) but fp32 params+grads are still a
+12.4GB floor → 19.1GB, over cap. The lever that actually gets under 18GB without
+shrinking the model is **bf16 master weights** (params+grads 12.4GB → 6.2GB). That
+purity was already gone once we quantized the optimizer, so it's the honest move
+for 1.5B on a 24GB card.
+
+## Working config (all four levers) + throughput
+
+**bf16 weights + 8-bit Adam + gradient checkpointing**, ctx 512:
+
+| arm | batch | tok/s | peak VRAM | under 18GB? |
+|-----|------:|------:|----------:|:-----------:|
+| nsa (1.556B) | 8 | 2400 | 12.05GB | ✅ |
+| nsa | **16** | **2730** | **14.70GB** | ✅ **(recommended)** |
+| nsa | 24 | 2763 | 17.35GB | ✅ (max throughput, tight) |
+| nsa | 32 | — | OOM (~20GB) | ❌ |
+| full (1.426B) | 16 | 4216 | 13.91GB | ✅ |
+
+Checkpointing is **required** here (without it, NSA's 30 layers of full-score
+attention OOM even in bf16). Throughput plateaus past batch 16 (2730→2763), so
+**batch 16 is the pick**: 2730 tok/s at 14.7GB with real headroom. NSA runs ~0.65×
+the full arm's throughput — expected, since it computes three branches and pays the
+checkpointing recompute (and this is the deliberately-slow full-score path, not
+kernels).
+
+## Token-budget implication (the point of the smoke test)
+
+At **~2730 NSA tok/s** on one 3090: ~9.8M tok/hour, ~236M tok/day, ~0.47B over a
+weekend. A Chinchilla-optimal 1.5B (~30B tokens) would take **~127 days** — off the
+table on a single card. So rung 2b proper should target a **modest budget**
+(a few hundred M to ~1B tokens, i.e. hours-to-a-few-days), not compute-optimal
+scale. Fast kernels (Triton) and/or multi-GPU are what a real 1.5B run needs — a
+later rung.
+
+## Caveats
+
+Numbers are for the pure-PyTorch full-score path (correct, not fast). The
+bf16-master + 8-bit-Adam recipe trades numerical headroom for fit; a real run
+should watch for instability (loss spikes) and can fall back to fewer layers or a
+smaller `d_model` if needed. This rung measured *fit and speed only* — not loss.

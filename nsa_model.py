@@ -60,6 +60,7 @@ import math
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
+import torch.utils.checkpoint
 
 
 # ---------------------------------------------------------------------------
@@ -385,6 +386,7 @@ class NSATransformer(nn.Module):
         super().__init__()
         self.max_seq_len = max_seq_len
         self.attn_type = attn_type
+        self.grad_checkpoint = False   # toggled by trainer to trade compute for VRAM
         self.tok_emb = nn.Embedding(vocab_size, d_model)
         self.pos_emb = nn.Embedding(max_seq_len, d_model)
         self.blocks = nn.ModuleList([
@@ -414,7 +416,12 @@ class NSATransformer(nn.Module):
         pos = torch.arange(T, device=idx.device)
         x = self.tok_emb(idx) + self.pos_emb(pos)[None]
         for blk in self.blocks:
-            x = blk(x)
+            if self.grad_checkpoint and self.training:
+                # recompute each block's activations in backward instead of
+                # storing them — cuts activation VRAM at the cost of a 2nd forward.
+                x = torch.utils.checkpoint.checkpoint(blk, x, use_reentrant=False)
+            else:
+                x = blk(x)
         x = self.ln_f(x)
         logits = self.lm_head(x)
         loss = None
