@@ -5,6 +5,7 @@
 - **Rung 2b (smoke test)** — throughput + peak VRAM for the ~1.5B config on one 3090, to pick a token budget. See [Rung 2b](#rung-2b--15b-smoke-test-throughput--vram).
 - **Kernel rung (step 1)** — Triton forward kernel for the NSA selection branch + correctness gate + benchmark. See [Kernel rung](#kernel-rung-step-1--nsa-selection-forward-in-triton).
 - **Kernel rung (step 2)** — Triton backward kernel for selection (dQ/dK/dV) + gradcheck gate + benchmark. See [Kernel rung step 2](#kernel-rung-step-2--nsa-selection-backward-in-triton).
+- **Kernel rung (step 3)** — fuse compression + window into the kernel path; full three-branch fwd+bwd + gates + bench. See [Kernel rung step 3](#kernel-rung-step-3--fuse-compression--window-full-three-branch-path).
 
 ---
 
@@ -461,3 +462,103 @@ over the gathered blocks and only allocates dQ/dK/dV.
 
 `set_per_process_memory_fraction(0.70)`, `set_num_threads(4)`, `nice -n 10`; OOM
 caught, never crashes the process or spills.
+
+---
+
+# Kernel rung (step 3) — fuse compression + window (full three-branch path)
+
+**Question:** can we bring **all three NSA branches** onto the kernel path
+(compression + selection + window, recombined by the gate) and keep flat-VRAM
+scaling — forward *and* backward? This step is **fusion only**; wiring into
+`nsa_model.py` is the separate final step. Purely additive: rung-1/2a, the forward
+kernel, and the backward kernel are untouched — this composes them.
+
+## Design choice: separate-but-composable, NOT a mega-kernel
+
+The three branches are each softmax-normalized **independently** and then **linearly
+blended by the gate** — it is *not* one attention over concatenated keys. So a single
+mega-kernel would carry three online-softmax states + three mask logics per program
+(heavy register pressure, and a brutal fused backward on top of the already 2-pass /
+atomic / group-padded selection backward). Instead:
+
+- **selection** — reuse the step-1/step-2 kernel **unchanged**.
+- **compression + window** — *one generic "range-attention" kernel* (fwd+bwd) with a
+  `MODE` flag, because both are "query *t* attends a contiguous causal key range":
+  window `[t−W+1, t]` over raw keys; compression `[0, (t+1)//Bsz − 1]` over pooled
+  summary tokens. A **runtime-bounded tile loop** keeps window at O(T·W), not O(T²).
+- **pooling** (compression summary tokens) — plain torch block-mean (cheap O(T·D),
+  differentiable), kept out of the kernel.
+- **gate combine** — torch elementwise.
+
+Each branch attention is its own `autograd.Function` (Triton fwd + Triton bwd), so
+PyTorch autograd chains the whole fused forward — **no monolithic backward needed**,
+and gradcheck on the fused output exercises everything.
+
+## Files (added this step)
+
+| file | what |
+|------|------|
+| `nsa_fused_kernel.py` | Generic range-attention kernel (fwd+bwd) for compression/window; `nsa_fused_forward` (kernel path) + `nsa_fused_reference` (pure-torch three-branch, = rung-1 math). |
+| `test_kernel_fused.py` | Forward allclose + backward gradcheck (all 8 differentiable inputs). |
+| `bench_kernel_fused.py` | Fused forward tok/s + VRAM sweep → CSV + two plots. |
+
+## Masking per branch (the causal/boundary rules, matched to rung-1)
+
+- **compression**: summary token *j* visible to query *t* iff `(j+1)·Bsz − 1 ≤ t`
+  ⇒ range `[0, (t+1)//Bsz − 1]` over the pooled sequence. Rows with `t < Bsz` have
+  **no** valid block → output 0 (finite `NEG` + zeroing, never NaN).
+- **selection**: unchanged (gathered blocks, causal within block).
+- **window**: `key ≤ query` and `query − key < W` ⇒ range `[t−W+1, t]`.
+
+## Gates — both GREEN
+
+Same config matrix as fwd/bwd (seq_len, GQA `G=1/2/3/4`, head dim 32/64/128,
+block_size, `S >` valid); analytical-vs-analytical for backward.
+
+| gate | dtype | max error | tol | verdict |
+|------|-------|----------:|-----|:-------:|
+| forward (3-branch) | fp32 | 5.4e-7 | 2e-3 | **PASS** (7/7) |
+| forward (3-branch) | bf16 | 3.9e-3 | 3e-2 | **PASS** (7/7) |
+| gradcheck (q,kc,vc,ks,vs,kw,vw,gate) | fp32 | 4.3e-6 | 3e-3 | **PASS** (7/7) |
+| gradcheck (8 inputs) | bf16 | 1.6e-2 | 7e-2 | **PASS** (7/7) |
+
+(grads to `kc`/`vc` flow through the torch block-mean pooling via autograd.)
+
+## Bench — flat VRAM holds for the whole fused path
+
+`B1 Hq16 Hkv4 D64, block_size 64, S 16, window 512`. Reference materializes `[T,T]`
+for window + selection (O(T²)); the fused kernel path never does.
+
+| seq_len | fused tok/s | fused VRAM | ref tok/s | ref VRAM |
+|--------:|------------:|-----------:|----------:|---------:|
+| 1024  | 205k | 0.03 GB | 280k | 0.25 GB |
+| **2048**  | 198k | 0.05 GB | 161k | 0.93 GB | ← kernel wins from here |
+| 4096  | 206k | 0.08 GB | 84k  | 3.62 GB |
+| 8192  | 194k | 0.16 GB | 41k  | 14.27 GB |
+| 16384 | 182k | 0.30 GB | **OOM** | **OOM** |
+| 32768 | 161k | 0.59 GB | OOM | OOM |
+
+![vram-fused](plots/vram_vs_seqlen_fused.png)
+![toks-fused](plots/toks_vs_seqlen_fused.png)
+
+- **Flat-VRAM confirmed for all three branches**: fused 0.009 → 0.59 GB (O(T)),
+  runs to 32k; reference O(T²), **OOM at seq_len ≥ 16384** (logged as data).
+- **Throughput crossover at 2048** — the full fused forward beats dense from 2k
+  onward *and* keeps going where dense OOMs. (Better than the backward-only step,
+  which never crossed before OOM, because the forward path is single-pass, no atomics.)
+
+## Bug hit
+
+The range kernel referenced module-global `MODE_WINDOW` inside `@triton.jit` →
+`NameError: Cannot access global variable ... not constexpr`. Fixed by comparing the
+`MODE` constexpr arg against a literal (`if MODE == 0:`) inside the kernel. Also
+trimmed the autotune space (2 MODEs × fwd/bwd compile many variants) to keep gate
+runtime reasonable.
+
+## Resource discipline / scope
+
+`set_per_process_memory_fraction(0.70)`, `set_num_threads(4)`, `nice -n 10`; OOM
+caught, never crashes/spills. Pooling and the gate-combine are torch (not fused into
+a kernel); q is re-read per branch — negligible here, and the win (flat VRAM,
+crossover at 2k) dominates. **Next (separate) step:** wire this fused path into
+`nsa_model.py` behind a flag.
