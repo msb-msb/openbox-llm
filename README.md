@@ -69,6 +69,17 @@ python test_integration.py             # ref vs fused: loss + grad parity gates
 python smoke_integration.py            # 150M NSA on the fused path (+ VRAM win)
 ```
 
+## Cloud / containers
+
+Reproducible Docker image + a checkpointing cloud entrypoint (`train.py`) for rented
+H100 (sm_90) pods — build, first-boot kernel validation, resume-on-kill, and the small
+proof-run config are all in **[DEPLOY.md](DEPLOY.md)**.
+
+```bash
+docker build -t openbox-llm:latest .
+docker run --gpus all -e VERIFY_KERNELS=1 openbox-llm:latest   # validate kernels on sm_90 first
+```
+
 Requires an NVIDIA GPU with Triton (developed on RTX 3090, sm_86; Hopper/sm_90 support in progress for cloud runs).
 
 ## Roadmap

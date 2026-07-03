@@ -1,0 +1,16 @@
+# keep the image lean + reproducible: never copy local venv/git/data/artifacts.
+.git/
+.venv/
+__pycache__/
+**/__pycache__/
+*.pyc
+data/
+*.pt
+*.log
+runs/
+plots/
+docs/
+*.pdf
+.claude/
+.dockerignore
+Dockerfile
