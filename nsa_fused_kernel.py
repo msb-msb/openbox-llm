@@ -210,9 +210,233 @@ def _range_attn_bwd_kernel(
 
 
 # ---------------------------------------------------------------------------
+# Q-TILED forward: raise tl.dot M by processing BLOCK_Q query positions per
+# program (perf rung). One program handles BLOCK_Q consecutive queries x G heads
+# = M = BLOCK_Q*G real rows (NO per-position pad to 16). With BLOCK_Q=16, M=16*G
+# is always a multiple of 16, and the real model (G=4) lands on M=64 -> full
+# tensor-core tiles instead of the M=16 pad. Consecutive queries also share
+# overlapping causal key ranges, so each K/V block is loaded once for all
+# BLOCK_Q rows (~BLOCK_Q x less K/V traffic on the window branch).
+#
+# Correctness is identical to _range_attn_fwd_kernel: same online softmax, same
+# per-(row,key) causal mask, same finite-NEG empty-row -> 0 handling. Purely
+# additive; the original per-query kernel above is untouched and stays the
+# fallback (USE_QTILE / unfriendly G).
+# ---------------------------------------------------------------------------
+@triton.autotune(configs=[triton.Config({}, num_warps=w, num_stages=st)
+                          for w in (4, 8) for st in (1, 2)],
+                 key=["G", "D", "BLOCK_N", "BLOCK_Q", "MODE"])
+@triton.jit
+def _range_attn_fwd_qtiled_kernel(
+    q_ptr, k_ptr, v_ptr, o_ptr,
+    sqb, sqh, sqt, skb, skh, skt, svb, svh, svt, sob, soh, sot,
+    T, Lk, scale, W, BS,
+    NUM_KV: tl.constexpr, MODE: tl.constexpr,
+    G: tl.constexpr, D: tl.constexpr, BLOCK_N: tl.constexpr, BLOCK_Q: tl.constexpr,
+    M_PAD: tl.constexpr,
+):
+    bh = tl.program_id(0)
+    qb = tl.program_id(1)
+    b = bh // NUM_KV
+    hkv = bh % NUM_KV
+    d = tl.arange(0, D)
+    n = tl.arange(0, BLOCK_N)
+
+    # M_PAD (power of 2) >= BLOCK_Q*G real rows; the last (M_PAD - BLOCK_Q*G) rows
+    # are padding lanes, masked out. Real model G=4 -> M_PAD=64 exact (no pad).
+    ROWS: tl.constexpr = BLOCK_Q * G
+    r = tl.arange(0, M_PAD)
+    qi = r // G                       # which query in the tile
+    gh = r % G                        # which head within the GQA group
+    i0 = qb * BLOCK_Q
+    qpos = i0 + qi                    # [M_PAD] absolute query position
+    head = hkv * G + gh              # [M_PAD] absolute query head
+    rmask = (r < ROWS) & (qpos < T)  # drop pad lanes + tail (T % BLOCK_Q != 0)
+
+    q = tl.load(q_ptr + b * sqb + qpos[:, None] * sqt + head[:, None] * sqh + d[None, :],
+                mask=rmask[:, None], other=0.0).to(tl.float32)
+
+    # per-row causal key range [lo_r, hi_r]  (MODE 0 = window, 1 = compression)
+    if MODE == 0:
+        hi_r = qpos
+        lo_r = qpos - W + 1
+    else:
+        hi_r = (qpos + 1) // BS - 1
+        lo_r = qpos * 0
+    lo_r = tl.maximum(lo_r, 0)
+
+    # scalar union range over the whole tile -> key-loop bounds
+    i_last = tl.minimum(i0 + BLOCK_Q - 1, T - 1)
+    if MODE == 0:
+        lo_min = tl.maximum(i0 - W + 1, 0)
+        hi_max = i_last
+    else:
+        lo_min = 0
+        hi_max = (i_last + 1) // BS - 1
+
+    NEG = -1.0e9
+    m = tl.full((M_PAD,), NEG, tl.float32)
+    l = tl.zeros((M_PAD,), tl.float32)
+    acc = tl.zeros((M_PAD, D), tl.float32)
+
+    lo0 = (lo_min // BLOCK_N) * BLOCK_N
+    n_iter = tl.where(hi_max < lo_min, 0, (hi_max - lo0) // BLOCK_N + 1)
+    for it in range(n_iter):
+        j = lo0 + it * BLOCK_N + n                       # [BLOCK_N] key positions
+        okj = (j >= 0) & (j < Lk)
+        safe = tl.where(okj, j, 0)
+        kb = tl.load(k_ptr + b * skb + hkv * skh + safe[:, None] * skt + d[None, :],
+                     mask=okj[:, None], other=0.0).to(tl.float32)
+        vb = tl.load(v_ptr + b * svb + hkv * svh + safe[:, None] * svt + d[None, :],
+                     mask=okj[:, None], other=0.0).to(tl.float32)
+        # per-(row,key) causal validity
+        ok = (j[None, :] >= lo_r[:, None]) & (j[None, :] <= hi_r[:, None]) \
+            & okj[None, :] & rmask[:, None]
+        sc = tl.dot(q, tl.trans(kb), input_precision="ieee") * scale
+        sc = tl.where(ok, sc, NEG)
+        m_cur = tl.max(sc, axis=1)
+        m_new = tl.maximum(m, m_cur)
+        alpha = tl.exp(m - m_new)
+        p = tl.where(ok, tl.exp(sc - m_new[:, None]), 0.0)
+        l = l * alpha + tl.sum(p, axis=1)
+        acc = acc * alpha[:, None] + tl.dot(p, vb, input_precision="ieee")
+        m = m_new
+
+    o = tl.where(l[:, None] == 0.0, 0.0, acc / l[:, None])
+    tl.store(o_ptr + b * sob + qpos[:, None] * sot + head[:, None] * soh + d[None, :],
+             o.to(o_ptr.dtype.element_ty), mask=rmask[:, None])
+
+
+# ---------------------------------------------------------------------------
+# Q-TILED backward (matches _range_attn_bwd_kernel; BLOCK_Q queries per program).
+# Same 2-pass recompute + per-(row,key) causal mask as the tiled forward. dK/dV
+# for a key block are summed over ALL BLOCK_Q*G rows via tl.dot(trans(ds), q)
+# before a SINGLE atomic_add per (program, key block) -> both wider MMA tiles AND
+# fewer atomics than the per-query kernel. Pad rows (r >= BLOCK_Q*G) carry p=0/q=0
+# so they contribute nothing to dq/dk/dv.
+# ---------------------------------------------------------------------------
+# NOTE num_stages=1 only: the 2-pass backward keeps many tiles live (dq, q, do,
+# kb, vb, p, ds); at D=128 / M_PAD=64 / BLOCK_N=64, num_stages=2 double-buffers to
+# ~144KB shared > the 3090's ~99KB (OutOfResources). Single-stage fits.
+@triton.autotune(configs=[triton.Config({}, num_warps=w, num_stages=1)
+                          for w in (4, 8)],
+                 key=["G", "D", "BLOCK_N", "BLOCK_Q", "MODE"],
+                 reset_to_zero=["dk_ptr", "dv_ptr"])
+@triton.jit
+def _range_attn_bwd_qtiled_kernel(
+    q_ptr, k_ptr, v_ptr, do_ptr, delta_ptr, dq_ptr, dk_ptr, dv_ptr,
+    sqb, sqh, sqt, skb, skh, skt, svb, svh, svt,
+    sdob, sdoh, sdot, sdlb, sdlh, sdlt,
+    sdqb, sdqh, sdqt, sdkb, sdkh, sdkt, sdvb, sdvh, sdvt,
+    T, Lk, scale, W, BS,
+    NUM_KV: tl.constexpr, MODE: tl.constexpr,
+    G: tl.constexpr, D: tl.constexpr, BLOCK_N: tl.constexpr, BLOCK_Q: tl.constexpr,
+    M_PAD: tl.constexpr,
+):
+    bh = tl.program_id(0)
+    qb = tl.program_id(1)
+    b = bh // NUM_KV
+    hkv = bh % NUM_KV
+    d = tl.arange(0, D)
+    n = tl.arange(0, BLOCK_N)
+
+    ROWS: tl.constexpr = BLOCK_Q * G
+    r = tl.arange(0, M_PAD)
+    qi = r // G
+    gh = r % G
+    i0 = qb * BLOCK_Q
+    qpos = i0 + qi
+    head = hkv * G + gh
+    rmask = (r < ROWS) & (qpos < T)
+
+    q = tl.load(q_ptr + b * sqb + qpos[:, None] * sqt + head[:, None] * sqh + d[None, :],
+                mask=rmask[:, None], other=0.0).to(tl.float32)
+    do = tl.load(do_ptr + b * sdob + qpos[:, None] * sdot + head[:, None] * sdoh + d[None, :],
+                 mask=rmask[:, None], other=0.0).to(tl.float32)
+    delta = tl.load(delta_ptr + b * sdlb + qpos * sdlt + head * sdlh,
+                    mask=rmask, other=0.0).to(tl.float32)
+
+    if MODE == 0:
+        hi_r = qpos
+        lo_r = qpos - W + 1
+    else:
+        hi_r = (qpos + 1) // BS - 1
+        lo_r = qpos * 0
+    lo_r = tl.maximum(lo_r, 0)
+
+    i_last = tl.minimum(i0 + BLOCK_Q - 1, T - 1)
+    if MODE == 0:
+        lo_min = tl.maximum(i0 - W + 1, 0)
+        hi_max = i_last
+    else:
+        lo_min = 0
+        hi_max = (i_last + 1) // BS - 1
+
+    NEG = -1.0e9
+    lo0 = (lo_min // BLOCK_N) * BLOCK_N
+    n_iter = tl.where(hi_max < lo_min, 0, (hi_max - lo0) // BLOCK_N + 1)
+
+    # pass 1: recompute (m, l)
+    m = tl.full((M_PAD,), NEG, tl.float32)
+    l = tl.zeros((M_PAD,), tl.float32)
+    for it in range(n_iter):
+        j = lo0 + it * BLOCK_N + n
+        okj = (j >= 0) & (j < Lk)
+        safe = tl.where(okj, j, 0)
+        kb = tl.load(k_ptr + b * skb + hkv * skh + safe[:, None] * skt + d[None, :],
+                     mask=okj[:, None], other=0.0).to(tl.float32)
+        sc = tl.dot(q, tl.trans(kb), input_precision="ieee") * scale
+        ok = (j[None, :] >= lo_r[:, None]) & (j[None, :] <= hi_r[:, None]) \
+            & okj[None, :] & rmask[:, None]
+        sc = tl.where(ok, sc, NEG)
+        m_cur = tl.max(sc, axis=1)
+        m_new = tl.maximum(m, m_cur)
+        alpha = tl.exp(m - m_new)
+        p = tl.where(ok, tl.exp(sc - m_new[:, None]), 0.0)
+        l = l * alpha + tl.sum(p, axis=1)
+        m = m_new
+    l_safe = tl.where(l == 0.0, 1.0, l)
+
+    # pass 2: grads
+    dq = tl.zeros((M_PAD, D), tl.float32)
+    for it in range(n_iter):
+        j = lo0 + it * BLOCK_N + n
+        okj = (j >= 0) & (j < Lk)
+        safe = tl.where(okj, j, 0)
+        kb = tl.load(k_ptr + b * skb + hkv * skh + safe[:, None] * skt + d[None, :],
+                     mask=okj[:, None], other=0.0).to(tl.float32)
+        vb = tl.load(v_ptr + b * svb + hkv * svh + safe[:, None] * svt + d[None, :],
+                     mask=okj[:, None], other=0.0).to(tl.float32)
+        sc = tl.dot(q, tl.trans(kb), input_precision="ieee") * scale
+        ok = (j[None, :] >= lo_r[:, None]) & (j[None, :] <= hi_r[:, None]) \
+            & okj[None, :] & rmask[:, None]
+        sc = tl.where(ok, sc, NEG)
+        p = tl.where(ok, tl.exp(sc - m[:, None]), 0.0) / l_safe[:, None]
+        dp = tl.dot(do, tl.trans(vb), input_precision="ieee")
+        ds = p * (dp - delta[:, None])
+        dq += tl.dot(ds, kb, input_precision="ieee") * scale
+        dk_c = tl.dot(tl.trans(ds), q, input_precision="ieee") * scale
+        dv_c = tl.dot(tl.trans(p), do, input_precision="ieee")
+        tl.atomic_add(dk_ptr + b * sdkb + hkv * sdkh + safe[:, None] * sdkt + d[None, :],
+                      dk_c, mask=okj[:, None])
+        tl.atomic_add(dv_ptr + b * sdvb + hkv * sdvh + safe[:, None] * sdvt + d[None, :],
+                      dv_c, mask=okj[:, None])
+
+    tl.store(dq_ptr + b * sdqb + qpos[:, None] * sdqt + head[:, None] * sdqh + d[None, :],
+             dq, mask=rmask[:, None])
+
+
+# ---------------------------------------------------------------------------
 # python wrappers + autograd Function for the range attention
 # ---------------------------------------------------------------------------
 _BLOCK_N = 64
+# The 2-pass q-tiled backward keeps q/do/kb/vb tiles live in fp32 shared at once;
+# kb/vb scale with BLOCK_N, so at D=128 / M_PAD=64 a key tile of 64 overflows the
+# 3090's ~99KB shared. 32 keeps it under the limit. Forward has fewer live tiles
+# and stays at 64.
+_BLOCK_N_BWD = 32
+_BLOCK_Q = 16          # queries per program in the q-tiled path (M = 16*G)
+USE_QTILE = True       # perf rung: use the q-tiled forward (fall back if False)
 
 
 def _range_attn_forward(q, k, v, mode, window, block_size):
@@ -221,6 +445,19 @@ def _range_attn_forward(q, k, v, mode, window, block_size):
     G = Hq // Hkv
     Lk = k.shape[2]
     o = torch.empty_like(q)
+    if USE_QTILE:
+        grid = (B * Hkv, triton.cdiv(T, _BLOCK_Q))
+        _range_attn_fwd_qtiled_kernel[grid](
+            q, k, v, o,
+            q.stride(0), q.stride(1), q.stride(2),
+            k.stride(0), k.stride(1), k.stride(2),
+            v.stride(0), v.stride(1), v.stride(2),
+            o.stride(0), o.stride(1), o.stride(2),
+            T, Lk, float(D ** -0.5), window, block_size,
+            NUM_KV=Hkv, MODE=mode, G=G, D=D, BLOCK_N=_BLOCK_N, BLOCK_Q=_BLOCK_Q,
+            M_PAD=triton.next_power_of_2(_BLOCK_Q * G),
+        )
+        return o
     grid = (B * Hkv, T)
     _range_attn_fwd_kernel[grid](
         q, k, v, o,
@@ -244,6 +481,26 @@ def _range_attn_backward(q, k, v, o, do, mode, window, block_size):
     dq = torch.zeros(B, Hq, T, D, device=q.device, dtype=torch.float32)
     dk = torch.zeros(B, Hkv, Lk, D, device=q.device, dtype=torch.float32)
     dv = torch.zeros(B, Hkv, Lk, D, device=q.device, dtype=torch.float32)
+    if USE_QTILE:
+        # q/do/dq tiles are [M_PAD, D] (BLOCK_N-independent); at D>=128 they alone
+        # crowd the 3090's ~99KB shared, so shrink the key tile further there.
+        bn_bwd = 16 if D >= 128 else _BLOCK_N_BWD
+        grid = (B * Hkv, triton.cdiv(T, _BLOCK_Q))
+        _range_attn_bwd_qtiled_kernel[grid](
+            q, k, v, do, delta, dq, dk, dv,
+            q.stride(0), q.stride(1), q.stride(2),
+            k.stride(0), k.stride(1), k.stride(2),
+            v.stride(0), v.stride(1), v.stride(2),
+            do.stride(0), do.stride(1), do.stride(2),
+            delta.stride(0), delta.stride(1), delta.stride(2),
+            dq.stride(0), dq.stride(1), dq.stride(2),
+            dk.stride(0), dk.stride(1), dk.stride(2),
+            dv.stride(0), dv.stride(1), dv.stride(2),
+            T, Lk, float(D ** -0.5), window, block_size,
+            NUM_KV=Hkv, MODE=mode, G=G, D=D, BLOCK_N=bn_bwd, BLOCK_Q=_BLOCK_Q,
+            M_PAD=triton.next_power_of_2(_BLOCK_Q * G),
+        )
+        return dq.to(q.dtype), dk.to(k.dtype), dv.to(v.dtype)
     grid = (B * Hkv, T)
     _range_attn_bwd_kernel[grid](
         q, k, v, do, delta, dq, dk, dv,
