@@ -40,6 +40,8 @@ def _env(key, default, cast):
 PRESETS = {
     "198m": dict(d_model=1024, n_layers=12, n_q_heads=16, n_kv_heads=4,
                  ffn_mult=4, seq_len=1024),   # ~200M proof default
+    "500m": dict(d_model=1536, n_layers=16, n_q_heads=12, n_kv_heads=3,
+                 ffn_mult=4, seq_len=1024),   # GQA 4:1, head dim 128
     "1.5b": dict(d_model=2048, n_layers=29, n_q_heads=16, n_kv_heads=4,
                  ffn_mult=4, seq_len=1024),   # GQA 4:1, head dim 128, ~1.50B params
 }
