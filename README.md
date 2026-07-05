@@ -46,6 +46,7 @@ Plots + CSVs in `plots/`. Every result has a green correctness gate behind it (s
 - **LARQL** — *most speculative for us.* Chris Hay's [chrishayuk/larql](https://github.com/chrishayuk/larql) — query and edit model weights like a graph database. Our bet: use it as the inspection/patch layer for the memory store.
 - **SubQ-style subquadratic** — *claims, not facts.* Testing the direction honestly.
 - **Hot/cold offload** — *the mechanism that makes the small-GPU goal real.* Explicit top-k makes residency a lookup, not a forecast (cf. PowerInfer). The right engine may be something else — open question.
+- **Knowledge injection vs RAG** — *most speculative.* Inject document knowledge into memory (via LARQL), inspectable/editable — the open question is faithful recall at scale vs a RAG baseline.
 
 ## Run it
 
