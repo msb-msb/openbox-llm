@@ -34,15 +34,30 @@ def _env(key, default, cast):
     return cast(os.environ.get(key, default))
 
 
+# Model-size presets (env-driven, additive). PRESET picks the DEFAULTS for the
+# model-dim knobs below; any explicit D_MODEL/N_LAYERS/... env var still overrides.
+# Default preset "198m" reproduces the original ~200M defaults byte-for-byte.
+PRESETS = {
+    "198m": dict(d_model=1024, n_layers=12, n_q_heads=16, n_kv_heads=4,
+                 ffn_mult=4, seq_len=1024),   # ~200M proof default
+    "1.5b": dict(d_model=2048, n_layers=29, n_q_heads=16, n_kv_heads=4,
+                 ffn_mult=4, seq_len=1024),   # GQA 4:1, head dim 128, ~1.50B params
+}
+
+
 def get_config(argv):
+    preset = os.environ.get("PRESET", "198m").lower()
+    assert preset in PRESETS, f"PRESET must be one of {list(PRESETS)}, got {preset!r}"
+    P = PRESETS[preset]
     C = dict(
-        # --- model (~200M proof default: 1024d x 12L, GQA 16q/4kv) ---
-        d_model=_env("D_MODEL", 1024, int),
-        n_layers=_env("N_LAYERS", 12, int),
-        n_q_heads=_env("N_Q_HEADS", 16, int),
-        n_kv_heads=_env("N_KV_HEADS", 4, int),
-        ffn_mult=_env("FFN_MULT", 4, int),
-        seq_len=_env("SEQ_LEN", 1024, int),
+        # --- model (PRESET sets these defaults; explicit env vars override) ---
+        preset=preset,
+        d_model=_env("D_MODEL", P["d_model"], int),
+        n_layers=_env("N_LAYERS", P["n_layers"], int),
+        n_q_heads=_env("N_Q_HEADS", P["n_q_heads"], int),
+        n_kv_heads=_env("N_KV_HEADS", P["n_kv_heads"], int),
+        ffn_mult=_env("FFN_MULT", P["ffn_mult"], int),
+        seq_len=_env("SEQ_LEN", P["seq_len"], int),
         block_size=_env("BLOCK_SIZE", 32, int),
         n_selected_blocks=_env("N_SELECTED_BLOCKS", 8, int),
         window=_env("WINDOW", 256, int),
