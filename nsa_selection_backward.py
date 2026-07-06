@@ -190,67 +190,16 @@ def selection_backward_triton(q, k, v, block_idx, block_size, do, o):
 
 
 # ===========================================================================
-# FSA backward (Chunk 2): dQ-only (query-outer, unchanged) + block-outer dK/dV.
+# FSA backward (Chunks 2-3b): ONE block-outer kernel emits dK, dV AND per-pair dQ
+# partials; dQ is then reduced with index_add_. Atomic-free in the kernel, real-M
+# (no GP-16 pad), K/V loaded once per block, softmax via stored LSE (no recompute).
 # ===========================================================================
 
-# dQ-only, SINGLE-PASS (Chunk 3): dQ is owned per query program (no conflict), so it
-# stays query-outer, but the pass-1 (m,l) recompute is gone — we consume the stored
-# LSE and form p = exp(sc - lse) directly. Numerically safe: l >= 1 always (the max
-# element gives exp(0)=1), so sc - lse <= -log(l) <= 0 and exp never overflows.
-@triton.autotune(configs=_autotune_configs(), key=["G", "D", "BLOCK_N", "S"])
-@triton.jit
-def _selection_dq_kernel(
-    q_ptr, k_ptr, v_ptr, idx_ptr, do_ptr, delta_ptr, lse_ptr, dq_ptr,
-    sqb, sqh, sqt, skb, skh, skt, svb, svh, svt,
-    sib, sih, sit, sis, sdob, sdoh, sdot, sdlb, sdlh, sdlt,
-    slb, slh, slt, sdqb, sdqh, sdqt,
-    T, scale,
-    NUM_KV: tl.constexpr, G: tl.constexpr, GP: tl.constexpr, D: tl.constexpr,
-    BLOCK_N: tl.constexpr, S: tl.constexpr,
-):
-    bh = tl.program_id(0)
-    i = tl.program_id(1)
-    b = bh // NUM_KV
-    hkv = bh % NUM_KV
-    g = tl.arange(0, GP)
-    d = tl.arange(0, D)
-    n = tl.arange(0, BLOCK_N)
-    g_ok = g < G
-    h0 = hkv * G
-
-    q = tl.load(q_ptr + b * sqb + i * sqt + (h0 + g)[:, None] * sqh + d[None, :],
-                mask=g_ok[:, None], other=0.0).to(tl.float32)
-    do = tl.load(do_ptr + b * sdob + i * sdot + (h0 + g)[:, None] * sdoh + d[None, :],
-                 mask=g_ok[:, None], other=0.0).to(tl.float32)
-    delta = tl.load(delta_ptr + b * sdlb + i * sdlt + (h0 + g) * sdlh,
-                    mask=g_ok, other=0.0).to(tl.float32)
-    lse = tl.load(lse_ptr + b * slb + i * slt + (h0 + g) * slh,
-                  mask=g_ok, other=0.0).to(tl.float32)          # stored softmax stat
-    NEG = -1.0e9
-
-    dq = tl.zeros((GP, D), tl.float32)
-    for s in range(S):
-        blk = tl.load(idx_ptr + b * sib + hkv * sih + i * sit + s * sis)
-        pos = blk * BLOCK_N + n
-        kv_ok = (blk >= 0) & (pos <= i) & (pos < T)
-        safe = tl.where(kv_ok, pos, 0)
-        kb = tl.load(k_ptr + b * skb + hkv * skh + safe[:, None] * skt + d[None, :],
-                     mask=kv_ok[:, None], other=0.0).to(tl.float32)
-        vb = tl.load(v_ptr + b * svb + hkv * svh + safe[:, None] * svt + d[None, :],
-                     mask=kv_ok[:, None], other=0.0).to(tl.float32)
-        sc = tl.dot(q, tl.trans(kb), input_precision="ieee") * scale
-        p = tl.where(kv_ok[None, :], tl.exp(sc - lse[:, None]), 0.0)   # normalized via LSE
-        dp = tl.dot(do, tl.trans(vb), input_precision="ieee")
-        ds = p * (dp - delta[:, None])
-        dq += tl.dot(ds, kb, input_precision="ieee") * scale
-    tl.store(dq_ptr + b * sdqb + i * sdqt + (h0 + g)[:, None] * sdqh + d[None, :],
-             dq, mask=g_ok[:, None])
-
-
-# block-outer dK/dV: one program owns KV block j. Loads block j's K/V once, loops
-# its attending queries (from the CSR index) so REAL queries×heads fill the MMA
-# M-dim (no GP-16 pad), consumes stored LSE (no pass-1 recompute), and writes a
-# DISJOINT slice dK[j]/dV[j] once — no atomics.
+# block-outer: one program owns KV block j. Loads block j's K/V once, loops its
+# attending queries (from the CSR index) so REAL queries×heads fill the MMA M-dim
+# (no GP-16 pad), consumes stored LSE (no pass-1 recompute). Writes DISJOINT dK[j]/
+# dV[j] slices (no atomics) and, reusing ds + the loaded K, a per-pair dQ partial
+# (dq = ds@k) into dqbuf for a downstream index_add_ reduce.
 def _dkdv_cfgs():
     return [triton.Config({}, num_warps=w, num_stages=1) for w in (2, 4, 8)]
 
@@ -258,10 +207,11 @@ def _dkdv_cfgs():
 @triton.autotune(configs=_dkdv_cfgs(), key=["G", "D", "BLOCK_N", "BLOCK_Q"])
 @triton.jit
 def _selection_dkdv_kernel(
-    q_ptr, k_ptr, v_ptr, do_ptr, delta_ptr, lse_ptr, qob_ptr, off_ptr, dk_ptr, dv_ptr,
+    q_ptr, k_ptr, v_ptr, do_ptr, delta_ptr, lse_ptr, qob_ptr, off_ptr,
+    dk_ptr, dv_ptr, dqbuf_ptr,
     sqb, sqh, sqt, skb, skh, skt, svb, svh, svt, sdob, sdoh, sdot,
     sdlb, sdlh, sdlt, slb, slh, slt, soffb, soffh, soffj,
-    sdkb, sdkh, sdkt, sdvb, sdvh, sdvt,
+    sdkb, sdkh, sdkt, sdvb, sdvh, sdvt, sqbp, sqbg,
     T, scale,
     NUM_KV: tl.constexpr, G: tl.constexpr, D: tl.constexpr,
     BLOCK_N: tl.constexpr, BLOCK_Q: tl.constexpr, M_PAD: tl.constexpr,
@@ -313,6 +263,12 @@ def _selection_dkdv_kernel(
         ds = p * (dp - delta_[:, None])
         dv += tl.dot(tl.trans(p), do_, input_precision="ieee")         # [BLOCK_N, D]
         dk += tl.dot(tl.trans(ds), q_, input_precision="ieee") * scale
+        # dQ contribution of THIS block for its attending queries -> per-pair buffer
+        # (fused: reuses ds + the loaded K; real-M, no GP-16 pad). Reduced in torch.
+        dq_row = tl.dot(ds, kb, input_precision="ieee") * scale        # [M_PAD, D]
+        pair = base + it * BLOCK_Q + qi                                # [M_PAD] pair index
+        tl.store(dqbuf_ptr + pair[:, None] * sqbp + gh[:, None] * sqbg + d[None, :],
+                 dq_row, mask=row_ok[:, None])
 
     # disjoint per-block write -> no atomics
     tl.store(dk_ptr + b * sdkb + hkv * sdkh + pos[:, None] * sdkt + d[None, :], dk)
@@ -320,37 +276,25 @@ def _selection_dkdv_kernel(
 
 
 def selection_backward_fsa(q, k, v, block_idx, block_size, do, o, lse):
-    """FSA backward: dQ-only (query-outer) + block-outer atomic-free dK/dV.
+    """FSA backward: ONE block-outer kernel emits dK, dV AND per-pair dQ partials
+    (fused, atomic-free, real-M no GP-16 pad); dQ is then reduced with index_add_.
     Returns dq, dk, dv (same shapes/dtype as q, k, v)."""
     B, Hq, T, D = q.shape
     Hkv = k.shape[1]
     G = Hq // Hkv
-    S = block_idx.shape[-1]
     n_blk = T // block_size
     idx = block_idx.to(torch.int32).contiguous()
     do = do.contiguous()
     delta = (do.float() * o.float()).sum(-1).contiguous()      # [B,Hq,T]
-    dq = torch.zeros(B, Hq, T, D, device=q.device, dtype=torch.float32)
     dk = torch.zeros(B, Hkv, T, D, device=q.device, dtype=torch.float32)
     dv = torch.zeros(B, Hkv, T, D, device=q.device, dtype=torch.float32)
     scale = float(D ** -0.5)
 
-    # dQ — query-outer, single-pass (consumes stored LSE, no pass-1 recompute)
-    _selection_dq_kernel[(B * Hkv, T)](
-        q, k, v, idx, do, delta, lse, dq,
-        q.stride(0), q.stride(1), q.stride(2),
-        k.stride(0), k.stride(1), k.stride(2),
-        v.stride(0), v.stride(1), v.stride(2),
-        idx.stride(0), idx.stride(1), idx.stride(2), idx.stride(3),
-        do.stride(0), do.stride(1), do.stride(2),
-        delta.stride(0), delta.stride(1), delta.stride(2),
-        lse.stride(0), lse.stride(1), lse.stride(2),
-        dq.stride(0), dq.stride(1), dq.stride(2),
-        T, scale, NUM_KV=Hkv, G=G, GP=16, D=D, BLOCK_N=block_size, S=S,
-    )
+    # inverted CSR (Chunk 1). pair_bh gives the (b,hkv) group of each pair for the reduce.
+    q_of_block, block_offsets, pair_bh = build_block_to_query_csr(idx, block_size)
+    P = q_of_block.numel()
+    dq_buf = torch.zeros(P, G, D, device=q.device, dtype=torch.float32)   # per-pair dQ partial
 
-    # dK/dV — block-outer, atomic-free (Chunk-1 CSR + stored LSE)
-    q_of_block, block_offsets = build_block_to_query_csr(idx, block_size)
     # cap M_PAD so kb/vb [block_size,D] + q_/do_ [M_PAD,D] fit the 3090's ~99KB shared;
     # the block key tile (block_size*D) is the fixed cost, so shrink M_PAD when it's big.
     if D >= 128 and block_size >= 64:
@@ -361,7 +305,7 @@ def selection_backward_fsa(q, k, v, block_idx, block_size, do, o, lse):
         bq = 16
     M_PAD = max(16, triton.next_power_of_2(bq * G))   # tl.dot needs M >= 16
     _selection_dkdv_kernel[(B * Hkv, n_blk)](
-        q, k, v, do, delta, lse, q_of_block, block_offsets, dk, dv,
+        q, k, v, do, delta, lse, q_of_block, block_offsets, dk, dv, dq_buf,
         q.stride(0), q.stride(1), q.stride(2),
         k.stride(0), k.stride(1), k.stride(2),
         v.stride(0), v.stride(1), v.stride(2),
@@ -371,8 +315,22 @@ def selection_backward_fsa(q, k, v, block_idx, block_size, do, o, lse):
         block_offsets.stride(0), block_offsets.stride(1), block_offsets.stride(2),
         dk.stride(0), dk.stride(1), dk.stride(2),
         dv.stride(0), dv.stride(1), dv.stride(2),
+        dq_buf.stride(0), dq_buf.stride(1),
         T, scale, NUM_KV=Hkv, G=G, D=D, BLOCK_N=block_size, BLOCK_Q=bq, M_PAD=M_PAD,
     )
+
+    # dQ reduce: sum each pair's partial into its query row. A query attends multiple
+    # blocks -> multiple pairs -> summed by index_add_. (Bulk torch scatter; the
+    # selection KERNELS stay atomic-free — this replaces per-key atomic contention.)
+    dq = torch.zeros(B, Hq, T, D, device=q.device, dtype=torch.float32)
+    pb = pair_bh.long()
+    b_ = pb // Hkv
+    hkv_ = pb % Hkv
+    qpos = q_of_block.long()
+    dqf = dq.view(B * Hq * T, D)
+    for gh in range(G):
+        flat = (b_ * Hq + hkv_ * G + gh) * T + qpos            # [P] rows in [B*Hq*T]
+        dqf.index_add_(0, flat, dq_buf[:, gh])
     return dq.to(q.dtype), dk.to(k.dtype), dv.to(v.dtype)
 
 

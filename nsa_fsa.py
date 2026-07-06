@@ -29,6 +29,8 @@ def build_block_to_query_csr(block_idx, block_size):
       block_offsets [B,Hkv,n_blk+1]   CSR row pointers (GLOBAL offsets into q_of_block):
                                       block (b,hkv,j)'s queries are
                                       q_of_block[block_offsets[b,hkv,j] : block_offsets[b,hkv,j+1]]
+      pair_bh       [P]               group index (b*Hkv + hkv) of each pair, aligned with
+                                      q_of_block — lets a reduce recover (b, hkv) per pair
     """
     B, Hkv, T, S = block_idx.shape
     n_blk = T // block_size
@@ -57,5 +59,6 @@ def build_block_to_query_csr(block_idx, block_size):
     key = bh * n_blk + jj                                          # global block key
     order = torch.argsort(key, stable=True)                        # stable => query ascending
     q_of_block = ti[order].to(torch.int32).contiguous()
+    pair_bh = bh[order].to(torch.int32).contiguous()               # group per pair
 
-    return q_of_block, block_offsets
+    return q_of_block, block_offsets, pair_bh
