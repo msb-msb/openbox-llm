@@ -193,14 +193,17 @@ def selection_backward_triton(q, k, v, block_idx, block_size, do, o):
 # FSA backward (Chunk 2): dQ-only (query-outer, unchanged) + block-outer dK/dV.
 # ===========================================================================
 
-# dQ-only: the original backward MINUS the dK/dV atomics. dQ is owned per query
-# program (no conflict), so it is untouched; we only stop it also scattering dK/dV.
+# dQ-only, SINGLE-PASS (Chunk 3): dQ is owned per query program (no conflict), so it
+# stays query-outer, but the pass-1 (m,l) recompute is gone — we consume the stored
+# LSE and form p = exp(sc - lse) directly. Numerically safe: l >= 1 always (the max
+# element gives exp(0)=1), so sc - lse <= -log(l) <= 0 and exp never overflows.
 @triton.autotune(configs=_autotune_configs(), key=["G", "D", "BLOCK_N", "S"])
 @triton.jit
 def _selection_dq_kernel(
-    q_ptr, k_ptr, v_ptr, idx_ptr, do_ptr, delta_ptr, dq_ptr,
+    q_ptr, k_ptr, v_ptr, idx_ptr, do_ptr, delta_ptr, lse_ptr, dq_ptr,
     sqb, sqh, sqt, skb, skh, skt, svb, svh, svt,
-    sib, sih, sit, sis, sdob, sdoh, sdot, sdlb, sdlh, sdlt, sdqb, sdqh, sdqt,
+    sib, sih, sit, sis, sdob, sdoh, sdot, sdlb, sdlh, sdlt,
+    slb, slh, slt, sdqb, sdqh, sdqt,
     T, scale,
     NUM_KV: tl.constexpr, G: tl.constexpr, GP: tl.constexpr, D: tl.constexpr,
     BLOCK_N: tl.constexpr, S: tl.constexpr,
@@ -221,26 +224,9 @@ def _selection_dq_kernel(
                  mask=g_ok[:, None], other=0.0).to(tl.float32)
     delta = tl.load(delta_ptr + b * sdlb + i * sdlt + (h0 + g) * sdlh,
                     mask=g_ok, other=0.0).to(tl.float32)
+    lse = tl.load(lse_ptr + b * slb + i * slt + (h0 + g) * slh,
+                  mask=g_ok, other=0.0).to(tl.float32)          # stored softmax stat
     NEG = -1.0e9
-
-    m = tl.full((GP,), NEG, tl.float32)
-    l = tl.zeros((GP,), tl.float32)
-    for s in range(S):
-        blk = tl.load(idx_ptr + b * sib + hkv * sih + i * sit + s * sis)
-        pos = blk * BLOCK_N + n
-        kv_ok = (blk >= 0) & (pos <= i) & (pos < T)
-        safe = tl.where(kv_ok, pos, 0)
-        kb = tl.load(k_ptr + b * skb + hkv * skh + safe[:, None] * skt + d[None, :],
-                     mask=kv_ok[:, None], other=0.0).to(tl.float32)
-        sc = tl.dot(q, tl.trans(kb), input_precision="ieee") * scale
-        sc = tl.where(kv_ok[None, :], sc, NEG)
-        m_cur = tl.max(sc, axis=1)
-        m_new = tl.maximum(m, m_cur)
-        alpha = tl.exp(m - m_new)
-        p_row = tl.where(kv_ok[None, :], tl.exp(sc - m_new[:, None]), 0.0)
-        l = l * alpha + tl.sum(p_row, axis=1)
-        m = m_new
-    l_safe = tl.where(l == 0.0, 1.0, l)
 
     dq = tl.zeros((GP, D), tl.float32)
     for s in range(S):
@@ -253,8 +239,7 @@ def _selection_dq_kernel(
         vb = tl.load(v_ptr + b * svb + hkv * svh + safe[:, None] * svt + d[None, :],
                      mask=kv_ok[:, None], other=0.0).to(tl.float32)
         sc = tl.dot(q, tl.trans(kb), input_precision="ieee") * scale
-        sc = tl.where(kv_ok[None, :], sc, NEG)
-        p = tl.where(kv_ok[None, :], tl.exp(sc - m[:, None]), 0.0) / l_safe[:, None]
+        p = tl.where(kv_ok[None, :], tl.exp(sc - lse[:, None]), 0.0)   # normalized via LSE
         dp = tl.dot(do, tl.trans(vb), input_precision="ieee")
         ds = p * (dp - delta[:, None])
         dq += tl.dot(ds, kb, input_precision="ieee") * scale
@@ -350,15 +335,16 @@ def selection_backward_fsa(q, k, v, block_idx, block_size, do, o, lse):
     dv = torch.zeros(B, Hkv, T, D, device=q.device, dtype=torch.float32)
     scale = float(D ** -0.5)
 
-    # dQ — query-outer, unchanged
+    # dQ — query-outer, single-pass (consumes stored LSE, no pass-1 recompute)
     _selection_dq_kernel[(B * Hkv, T)](
-        q, k, v, idx, do, delta, dq,
+        q, k, v, idx, do, delta, lse, dq,
         q.stride(0), q.stride(1), q.stride(2),
         k.stride(0), k.stride(1), k.stride(2),
         v.stride(0), v.stride(1), v.stride(2),
         idx.stride(0), idx.stride(1), idx.stride(2), idx.stride(3),
         do.stride(0), do.stride(1), do.stride(2),
         delta.stride(0), delta.stride(1), delta.stride(2),
+        lse.stride(0), lse.stride(1), lse.stride(2),
         dq.stride(0), dq.stride(1), dq.stride(2),
         T, scale, NUM_KV=Hkv, G=G, GP=16, D=D, BLOCK_N=block_size, S=S,
     )
