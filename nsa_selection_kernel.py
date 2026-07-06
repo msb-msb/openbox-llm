@@ -93,12 +93,13 @@ def _autotune_configs():
 @triton.autotune(configs=_autotune_configs(), key=["G", "D", "BLOCK_N", "S"])
 @triton.jit
 def _selection_fwd_kernel(
-    q_ptr, k_ptr, v_ptr, idx_ptr, o_ptr,
+    q_ptr, k_ptr, v_ptr, idx_ptr, o_ptr, lse_ptr,
     sqb, sqh, sqt,               # q strides (head dim contiguous: sqd == 1)
     skb, skh, skt,               # k strides
     svb, svh, svt,               # v strides
     sib, sih, sit, sis,          # block_idx strides
     sob, soh, sot,               # o strides
+    slb, slh, slt,               # lse strides ([B,Hq,T])
     T, scale,
     NUM_KV: tl.constexpr,        # Hkv, to split the flattened (batch,kv) grid dim
     G: tl.constexpr, GP: tl.constexpr, D: tl.constexpr,
@@ -154,9 +155,19 @@ def _selection_fwd_kernel(
     o_ptrs = o_ptr + b * sob + i * sot + (h0 + g)[:, None] * soh + d[None, :]
     tl.store(o_ptrs, o.to(o_ptr.dtype.element_ty), mask=g_ok[:, None])
 
+    # log-sum-exp per (query, head), finite sentinel for empty rows (FSA prereq 0).
+    # Additive: consumed by the FSA backward; the ref path ignores it.
+    lse = tl.where(l == 0.0, NEG, m + tl.log(l))
+    tl.store(lse_ptr + b * slb + (h0 + g) * slh + i * slt, lse, mask=g_ok)
 
-def selection_forward_triton(q, k, v, block_idx, block_size):
-    """Launch wrapper. q [B,Hq,T,D], k/v [B,Hkv,T,D], block_idx [B,Hkv,T,S]."""
+
+def selection_forward_triton(q, k, v, block_idx, block_size, return_lse=False):
+    """Launch wrapper. q [B,Hq,T,D], k/v [B,Hkv,T,D], block_idx [B,Hkv,T,S].
+
+    return_lse=False (default) returns o only — unchanged for every existing caller.
+    return_lse=True returns (o, lse) where lse [B,Hq,T] = m + log(l) per (query,head),
+    with a finite sentinel (-1e9) for fully-masked (empty) rows.
+    """
     B, Hq, T, D = q.shape
     Hkv = k.shape[1]
     G = Hq // Hkv
@@ -168,16 +179,18 @@ def selection_forward_triton(q, k, v, block_idx, block_size):
     GP = 16          # pad the GQA group to 16 lanes so q@kᵀ / p@v use tl.dot
     idx = block_idx.to(torch.int32).contiguous()
     o = torch.empty_like(q)
+    lse = torch.empty(B, Hq, T, device=q.device, dtype=torch.float32)
 
     grid = (B * Hkv, T)
     _selection_fwd_kernel[grid](
-        q, k, v, idx, o,
+        q, k, v, idx, o, lse,
         q.stride(0), q.stride(1), q.stride(2),
         k.stride(0), k.stride(1), k.stride(2),
         v.stride(0), v.stride(1), v.stride(2),
         idx.stride(0), idx.stride(1), idx.stride(2), idx.stride(3),
         o.stride(0), o.stride(1), o.stride(2),
+        lse.stride(0), lse.stride(1), lse.stride(2),
         T, float(D ** -0.5),
         NUM_KV=Hkv, G=G, GP=GP, D=D, BLOCK_N=block_size, S=S,
     )
-    return o
+    return (o, lse) if return_lse else o
