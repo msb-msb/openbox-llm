@@ -271,6 +271,14 @@ the H100's much faster dense matmul shrinks selection's share of the step. The b
 transfers (the kernel gates pass on \texttt{sm\_90}); its end-to-end impact scales with how large a
 fraction the selection backward was to begin with.
 
+\paragraph{Selection forward.} Applying the same block-outer restructuring to the selection
+\emph{forward} (a split-K structure emitting per-query softmax partials into CSR-indexed buffers,
+combined by log-sum-exp) makes it $1.57\times$ faster in isolation at the 1.5\,B shape
+($4.28\to2.40$\,ms; up to $2.4\times$ at larger head dimension). Since the forward is only
+$\sim$7.6\% of the step, the incremental end-to-end gain is small ($1.034\times$ over the
+backward-only result), bringing the combined kernel speedup to $\sim$1.69$\times$. A stricter shape
+gate ($D\ge128$) keeps the original path where the CSR overhead would not amortize.
+
 \begin{figure}[t]
 \centering
 \includegraphics[width=0.62\linewidth]{fsa_progression.png}
@@ -333,8 +341,9 @@ honestly and its worst cost identified and then removed.
 \paragraph{Roadmap.} The program proceeds by \emph{component}, not by model size, each step gated by
 the last:
 \begin{enumerate}[leftmargin=1.4em,itemsep=2pt]
-\item \textbf{Selection forward} --- apply the same block-outer restructuring to the forward pass
-(still GQA-padded, a smaller $\sim$7.6\% of the step) now that the backward is done.
+\item \textbf{Distillation from a larger open teacher} --- with the base trained, distill from an
+open 27--35\,B teacher (logit/KL) to lift a small-token-budget 1.5\,B student to a usable capability
+level; the substrate the bets below are tested on.
 \item \textbf{Trainable memory layers}~\cite{memlayers} at the current scale --- test that capacity
 added as memory entries competes with dense parameters.
 \item \textbf{Hot/cold offload} --- drive residency from explicit memory-layer top-$k$, building on
