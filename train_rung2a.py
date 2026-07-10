@@ -122,6 +122,11 @@ def main():
     ap.add_argument("--n_selected_blocks", type=int, default=8)
     ap.add_argument("--window", type=int, default=64)
     ap.add_argument("--device", default="cuda" if torch.cuda.is_available() else "cpu")
+    ap.add_argument("--profile", action="store_true",
+                    help="profile ~N steps and exit; no training")
+    ap.add_argument("--profile_steps", type=int, default=20)
+    ap.add_argument("--profile_warmup", type=int, default=8)
+
     args = ap.parse_args()
 
     # ---- resource caps (leave the desktop usable) ------------------------
@@ -190,6 +195,31 @@ def main():
     t0 = time.time()
     train_iter = iter(train_loader)
     running = []
+    if args.profile:
+        from profile_step import profile_step
+        seen, n_params = set(), 0                 # dedup tied embeddings
+        for p in model.parameters():
+            if id(p) in seen: continue
+            seen.add(id(p)); n_params += p.numel()
+        pit = iter(train_loader)
+        xb, yb = next(pit)
+        xb, yb = xb.to(device, non_blocking=True), yb.to(device, non_blocking=True)
+
+        def step_fn():
+            with torch.autocast("cuda", dtype=amp_dtype, enabled=(device.type == "cuda")):
+                _, loss = model(xb, yb)
+            opt.zero_grad(set_to_none=True)
+            loss.backward()
+            torch.nn.utils.clip_grad_norm_(model.parameters(), args.grad_clip)
+            opt.step()
+
+        profile_step(step_fn, n_params=n_params,
+                     tokens_per_step=args.batch_size * args.seq_len,
+                     warmup=args.profile_warmup, active=args.profile_steps,
+                     trace=True, label=args.attn)
+        raise SystemExit
+
+
     for step in range(1, args.steps + 1):
         try:
             x, y = next(train_iter)
