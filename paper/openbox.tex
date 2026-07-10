@@ -35,11 +35,13 @@ attention configurations, confirm portability from Ampere (\texttt{sm\_86}) to H
 improvement from a query-tiling optimization on the contiguous-range branches. We pair this with
 an honest negative result and a diagnosis: the same optimization does not transfer to the
 selection branch, and a per-branch profile shows selection is in fact the \emph{dominant} training
-cost ($52.6\%$ of a step, driven by its backward pass). A roofline analysis explains why---the
+cost ($52.6\%$ of a step by profiler kernel-time, driven by its backward pass). A roofline analysis explains why---the
 selection branch is latency-bound, not compute-bound. Restructuring the selection backward
 block-outer and atomics-free, following concurrent NSA-kernel work~\cite{fsa}, then makes it
-$8.4\times$ faster at the 1.5\,B shape and yields a $1.63\times$ end-to-end training-step speedup,
-turning the dominant cost into a minor one. We release weights, data, training code,
+$8.4\times$ faster at the 1.5\,B shape, lifting the whole fwd+bwd step by a measured
+$1.08$--$1.36\times$ that grows with sequence length and batch as the branch's wall-clock share
+grows---smaller than a naive profiler-share projection implies, and reported as a curve rather
+than a single number. We release weights, data, training code,
 and kernels under a permissive license. Our contribution is not the invention of NSA (due to
 DeepSeek-AI~\cite{nsa}) but its open, reproducible realization, cross-architecture validation, and
 honest performance characterization, positioned as the substrate for the broader program.
@@ -69,8 +71,9 @@ Ampere (\texttt{sm\_86}) to Hopper (\texttt{sm\_90}). We report a $+53\%$ traini
 optimization on the contiguous-range branches, an honest negative result on the selection branch,
 and a profile showing selection dominates the training step ($52.6\%$)---a finding independently
 corroborated by concurrent NSA-kernel work~\cite{fsa}. Acting on that profile, we rebuild the
-selection backward block-outer and atomics-free, making it $8.4\times$ faster and the whole training
-step $1.63\times$ faster. We claim no large trained model; our own
+selection backward block-outer and atomics-free, making it $8.4\times$ faster in isolation and the
+whole fwd+bwd step a measured $1.08$--$1.36\times$ faster (rising with sequence length and batch;
+\S\ref{sec:perf}). We claim no large trained model; our own
 throughput measurements (\S\ref{sec:perf}) show why one is a funded, not incidental, undertaking. We
 position Open-Box as an open, reproducible \emph{substrate} and program, not a faster kernel than
 the specialized implementations~\cite{fsa,nosa} we build on.
@@ -83,8 +86,9 @@ labeled by how proven it currently is.
 correctness-checked against a reference at every step (\S\ref{sec:impl}--\ref{sec:validation}).
 \item Cross-architecture validation from Ampere to Hopper, all gates green (\S\ref{sec:portability}).
 \item Two measured optimizations---a $+53\%$ query-tiling gain on the range branches and an
-$8.4\times$ block-outer rebuild of the dominant selection backward ($1.63\times$ end-to-end)---with
-a roofline analysis and an honest negative result explaining which fix applies where (\S\ref{sec:perf}).
+$8.4\times$ block-outer rebuild of the dominant selection backward (a measured $1.08$--$1.36\times$
+end-to-end fwd+bwd, rising with context)---with a roofline analysis and an honest negative result
+explaining which fix applies where (\S\ref{sec:perf}).
 \item Full release of weights, data, code, and kernels under a permissive license.
 \end{itemize}
 
@@ -263,13 +267,40 @@ stays non-differentiable), and a shape gate retains the original kernel for the 
 where the restructured path's fixed cost would not amortize. All correctness gates stayed green and
 kernel-vs-reference gradient parity held ($\text{fp32}\lesssim10^{-5}$). At the 1.5\,B shape the
 selection backward drops from $23.3$ to $3.03$\,ms ($8.4\times$; $87.9\text{k}\to676\text{k}$
-tok/s), taking the branch from $45\%$ of the step to $\sim$10\% and yielding a measured $1.63\times$
-end-to-end training-step speedup (Fig.~\ref{fig:fsa})---turning the dominant cost into a minor one
-and lowering the wall-clock (and dollar) cost of any run by the same factor. This end-to-end figure
-is hardware-dependent: on an H100 the same rebuild gives a smaller $1.14\times$ step speedup, because
-the H100's much faster dense matmul shrinks selection's share of the step. The branch speedup itself
-transfers (the kernel gates pass on \texttt{sm\_90}); its end-to-end impact scales with how large a
-fraction the selection backward was to begin with.
+tok/s). Measured on the full fwd+bwd step (RTX 3090, fused path, no optimizer), swapping the atomic
+selection backward for the FSA kernel yields a \emph{configuration-dependent} end-to-end speedup that
+rises with the branch's share of the step: $1.08\times$ at seq 512, $1.18\times$ at seq 1024, and
+$1.26\times$ at seq 2048 (batch 1), reaching $1.36\times$ at seq 1024/batch 2 (Fig.~\ref{fig:e2e}).
+The isolated $8.4\times$ converts to these smaller end-to-end figures because the branch's
+\emph{wall-clock} share ($\sim$17--30\% across these configs) is smaller than the $45\%$ profiler
+\emph{kernel-time} share reported above: profiler self-CUDA time excludes launch gaps and counts
+overlap, so it overstates how much of the step the branch actually occupies. Killing a minority of
+the step, however fast, bounds the whole-step gain accordingly. The speedup grows with context but
+saturates: as sequence length increases, the range branches and the dense projections grow too, so
+selection's share stops rising and the end-to-end gain plateaus. We confirm this on an H100 (80\,GB),
+which reaches the long-context, batch-2 configurations the 3090 cannot hold: the measured speedup is
+$1.10\times$ at seq 512, $1.22\times$ at 1024, $1.29\times$ at 2048, and $1.33\times$ at 4096, then
+eases to $1.31\times$ at 8192 as selection's share peaks near $28\%$ and holds
+(Fig.~\ref{fig:e2e}). The H100 curve sits slightly below the 3090's at matched configurations---the
+Hopper's faster dense matmul shrinks selection's relative share, so the end-to-end gain is
+smaller---while the two track within a few points and their selection-share profiles nearly
+coincide, indicating the speedup is a property of the algorithm and configuration rather than the
+device. The kernels are portable to \texttt{sm\_90} (all gates green) but not Hopper-tuned; the
+ratios we report are unaffected by absolute-throughput tuning, since they compare the same fused
+path with the selection backward on versus off. A naive projection that multiplies the isolated
+$8.4\times$ by the $45\%$ profiler share would overstate all of these measured end-to-end figures.
+
+\begin{figure}[t]
+\centering
+\includegraphics[width=0.62\textwidth]{e2e_speedup_curve.png}
+\caption{Measured end-to-end fwd+bwd speedup (atomic $\to$ FSA selection backward) versus sequence
+length at the 1.5\,B shape, on an RTX 3090 (24\,GB) and an H100 (80\,GB). The gain rises with
+context as the selection backward's wall-clock share grows, then saturates near $1.33\times$ once
+the range branches and dense projections also grow; the H100 reaches the long-context batch-2
+configurations the 3090 cannot hold. Both cards track within a few points, and neither approaches
+the $1.63\times$ a profiler-share Amdahl projection would imply (dashed).}
+\label{fig:e2e}
+\end{figure}
 
 \paragraph{Selection forward.} Applying the same block-outer restructuring to the selection
 \emph{forward} (a split-K structure emitting per-query softmax partials into CSR-indexed buffers,
@@ -332,7 +363,7 @@ adopt.
 
 \section{Limitations and Research Program}
 We deliberately claim no large trained model. Our throughput measurements show a compute-optimal
-1.5\,B run remains a datacenter-budget undertaking on rented hardware even after the $1.63\times$
+1.5\,B run remains a datacenter-budget undertaking on rented hardware even after this
 speedup---the selection-backward rework lowers the cost but does not eliminate the need for funded
 compute. What we establish is the \emph{substrate}: correct, portable, and---after the rework of the
 dominant branch---reasonably efficient NSA kernels, with a performance envelope characterized
